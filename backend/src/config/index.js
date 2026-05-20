@@ -13,6 +13,7 @@ const config = {
   VAPI_API_KEY: process.env.VAPI_API_KEY,
   VAPI_ASSISTANT_ID: process.env.VAPI_ASSISTANT_ID,
 
+
   // Public base URL for webhooks
   BASE_URL: process.env.BASE_URL || 'http://localhost:3001',
 

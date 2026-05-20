@@ -4,6 +4,7 @@ const twilio        = require('twilio');
 const twilioService = require('../services/twilioService');
 const dbService     = require('../services/dbService');
 const callSession   = require('../utils/callSession');
+const callLogger    = require('../utils/callLogger');
 const { normalize } = require('../utils/phoneUtils');
 const otpStore      = require('../utils/otpStore');
 const topicBuffer   = require('../utils/topicBuffer');
@@ -47,6 +48,9 @@ class TwilioController {
       logger.info('Session already exists (Twilio retry)', { callSid: CallSid });
     }
 
+    callLogger.start(CallSid, { phone, direction: 'inbound', callId: record?.CallID || null });
+    callLogger.callEvent(CallSid, 'call_started', { phone, to: To, callId: record?.CallID || null });
+
     const squadId = config.VAPI_ASSISTANT_ID;
     logger.info(`Routing call → Vapi Squad via SIP`, { squadId, callSid: CallSid });
 
@@ -74,6 +78,13 @@ class TwilioController {
       });
 
       const session = callSession.get(CallSid);
+
+      // Flush call log if saveCallSummary didn't already do it (e.g. call dropped mid-way)
+      if (callLogger.has(CallSid)) {
+        callLogger.callEvent(CallSid, 'call_ended_by_status', { status: CallStatus, durationSecs: CallDuration || null });
+        await callLogger.flush(CallSid, { session });
+      }
+
       if (session.phone) otpStore.remove(session.phone);
       if (session.pendingAgentPhone) otpStore.remove(session.pendingAgentPhone);
       callSession.remove(CallSid);

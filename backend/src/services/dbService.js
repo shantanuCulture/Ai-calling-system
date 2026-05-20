@@ -6,7 +6,7 @@ class DbService {
   // ── Agent (existing tbl_agent table) ──────────────────────────────────────
 
   async getAgentByPhone(phone) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('phone', sql.VarChar(30), phone)
       .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE Contact = @phone`);
@@ -14,7 +14,7 @@ class DbService {
   }
 
   async getAgentById(agentId) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('AgentId', sql.VarChar(50), agentId)
       .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE AgentID = @AgentId`);
@@ -22,7 +22,7 @@ class DbService {
   }
 
   async getAgentByEmail(email) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('email', sql.VarChar(150), email)
       .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE EmailID = @email`);
@@ -30,7 +30,7 @@ class DbService {
   }
 
   async getAgentBookings(agentId) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('AgentId', sql.VarChar(50), agentId)
       .execute('USP_GetAgentBookings_Ai_call_system');
@@ -40,7 +40,7 @@ class DbService {
   // ── Countries ──────────────────────────────────────────────────────────────
 
   async getCountryList(agentId = '') {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('agentid', sql.VarChar(150), agentId)
       .execute('GetAllCountryList_Ai_call_system');
@@ -50,7 +50,7 @@ class DbService {
   // ── Packages ───────────────────────────────────────────────────────────────
 
   async getPackagesByCountry(countryCode, agentId = null) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('CountryCode', sql.NVarChar(50), countryCode)
       .input('AgentId', sql.NVarChar(50), agentId || '')
@@ -77,7 +77,7 @@ class DbService {
   }
 
   async getPackageItinerary(pkgId) {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request()
       .input('PkgId', sql.Int, parseInt(pkgId, 10))
       .execute('USP_GetPackageItinerary_Ai_call_system');
@@ -88,7 +88,7 @@ class DbService {
 
   async getCallerByPhone(phone) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('phone', sql.VarChar(20), phone)
         .execute('sp_GetCallerByPhone_Ai_call_system');
@@ -101,7 +101,7 @@ class DbService {
 
   async insertCallerRegistry({ phone, agent_id, caller_name, caller_email, customer_type, is_verified, verify_method }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('phone',         sql.VarChar(20),  phone)
         .input('agent_id',      sql.VarChar(50),  agent_id     || null)
@@ -111,6 +111,7 @@ class DbService {
         .input('is_verified',   sql.Bit,          is_verified  ?? 0)
         .input('verify_method', sql.VarChar(20),  verify_method || null)
         .execute('sp_InsertCallerRegistry_Ai_call_system');
+      logger.info(`[DB] insertCallerRegistry  phone=${phone}  type=${customer_type || 'unknown'}  verified=${is_verified ?? 0}  agentId=${agent_id || '-'}`);
       return r.recordset[0];
     } catch (err) {
       logger.error('insertCallerRegistry failed', { err: err.message });
@@ -120,7 +121,7 @@ class DbService {
 
   async updateCallerRegistry({ phone, agent_id, caller_name, caller_email, customer_type, is_verified, verify_method, verified_at, notes }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('phone',         sql.VarChar(20),  phone)
         .input('agent_id',      sql.VarChar(50),  agent_id      || null)
@@ -143,7 +144,7 @@ class DbService {
 
   async insertCallMaster({ twilio_call_sid, caller_phone, called_phone, direction, vapi_call_id }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50),  twilio_call_sid)
         .input('caller_phone',    sql.VarChar(20),  caller_phone)
@@ -151,7 +152,9 @@ class DbService {
         .input('direction',       sql.VarChar(10),  direction    || 'inbound')
         .input('vapi_call_id',    sql.VarChar(100), vapi_call_id || null)
         .execute('sp_InsertCallMaster_Ai_call_system');
-      return r.recordset[0]; // { CallID }
+      const row = r.recordset[0];
+      logger.info(`[DB] insertCallMaster → CallID=${row?.CallID}  sid=${twilio_call_sid}  phone=${caller_phone}`);
+      return row; // { CallID }
     } catch (err) {
       logger.error('insertCallMaster failed', { err: err.message });
       return null;
@@ -160,7 +163,7 @@ class DbService {
 
   async updateCallMaster({ twilio_call_sid, caller_status, agent_id, caller_name, caller_email, call_status, vapi_call_id, routed_to, routing_reason, is_resolved, recording_sid, recording_url }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50),   twilio_call_sid)
         .input('caller_status',   sql.VarChar(25),   caller_status   || null)
@@ -175,6 +178,8 @@ class DbService {
         .input('recording_sid',   sql.VarChar(50),   recording_sid   || null)
         .input('recording_url',   sql.VarChar(500),  recording_url   || null)
         .execute('sp_UpdateCallMaster_Ai_call_system');
+      const parts = [caller_status, agent_id ? `agentId=${agent_id}` : null, caller_name ? `name=${caller_name}` : null, call_status].filter(Boolean).join('  ');
+      logger.info(`[DB] updateCallMaster  sid=${twilio_call_sid}  ${parts}`);
       return r.recordset[0];
     } catch (err) {
       logger.error('updateCallMaster failed', { err: err.message });
@@ -184,13 +189,14 @@ class DbService {
 
   async updateCallTopic({ twilio_call_sid, topic_name, topic_entry }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const entry = typeof topic_entry === 'string' ? topic_entry : JSON.stringify(topic_entry);
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50),   twilio_call_sid)
         .input('topic_name',      sql.VarChar(50),   topic_name)
         .input('topic_entry',     sql.NVarChar(sql.MAX), entry)
         .execute('sp_UpdateCallTopic_Ai_call_system');
+      logger.info(`[DB] updateCallTopic  topic=${topic_name}  sid=${twilio_call_sid}`);
       return r.recordset[0];
     } catch (err) {
       logger.error('updateCallTopic failed', { err: err.message });
@@ -200,7 +206,7 @@ class DbService {
 
   async closeCallMaster({ twilio_call_sid, duration_secs, recording_sid, recording_url, call_summary, call_status, is_resolved }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50),   twilio_call_sid)
         .input('duration_secs',   sql.Int,           duration_secs  || null)
@@ -210,6 +216,7 @@ class DbService {
         .input('call_status',     sql.VarChar(20),   call_status    || null)
         .input('is_resolved',     sql.Bit,           is_resolved    ?? null)
         .execute('sp_CloseCallMaster_Ai_call_system');
+      logger.info(`[DB] closeCallMaster  sid=${twilio_call_sid}  status=${call_status}  resolved=${is_resolved ?? 'null'}  summary="${(call_summary || '').substring(0, 80)}"`);
       return r.recordset[0];
     } catch (err) {
       logger.error('closeCallMaster failed', { err: err.message });
@@ -219,7 +226,7 @@ class DbService {
 
   async getCallByTwilioSID(twilio_call_sid) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50), twilio_call_sid)
         .execute('sp_GetCallByTwilioSID_Ai_call_system');
@@ -234,7 +241,7 @@ class DbService {
 
   async insertCommunicationLog({ call_id, channel, recipient_phone, recipient_email, subject, body, twilio_msg_sid, status }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('call_id',          sql.BigInt,           call_id          || null)
         .input('channel',          sql.VarChar(20),      channel)
@@ -245,6 +252,8 @@ class DbService {
         .input('twilio_msg_sid',   sql.VarChar(50),      twilio_msg_sid   || null)
         .input('status',           sql.VarChar(20),      status           || 'sent')
         .execute('sp_InsertCommLog_Ai_call_system');
+      const to = recipient_phone || recipient_email || '-';
+      logger.info(`[DB] insertCommLog  channel=${channel}  to=${to}  callId=${call_id || 'null'}  sid=${twilio_msg_sid || '-'}`);
       return r.recordset[0];
     } catch (err) {
       logger.error('insertCommunicationLog failed', { err: err.message });
@@ -256,7 +265,7 @@ class DbService {
 
   async scheduleCallback({ phone, call_id, reason, department, priority }) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       const r = await pool.request()
         .input('phone',      sql.VarChar(20),   phone)
         .input('call_id',    sql.BigInt,        call_id    || null)
@@ -264,6 +273,7 @@ class DbService {
         .input('department', sql.VarChar(20),   department || 'sales')
         .input('priority',   sql.Int,           priority   || 1)
         .execute('sp_InsertCallback_Ai_call_system');
+      logger.info(`[DB] scheduleCallback  phone=${phone}  dept=${department || 'sales'}  callId=${call_id || 'null'}  reason="${(reason || '').substring(0, 60)}"`);
       return r.recordset[0];
     } catch (err) {
       logger.error('scheduleCallback failed', { err: err.message });
@@ -272,14 +282,14 @@ class DbService {
   }
 
   async getPendingCallbacks() {
-    const pool = await getPool();
+    const pool = getPool();
     const r = await pool.request().execute('sp_GetPendingCallbacks_Ai_call_system');
     return r.recordset;
   }
 
   async updateCallbackStatus(queue_id, status, notes) {
     try {
-      const pool = await getPool();
+      const pool = getPool();
       await pool.request()
         .input('queue_id', sql.BigInt,     queue_id)
         .input('status',   sql.VarChar(20), status)

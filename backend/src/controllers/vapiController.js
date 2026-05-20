@@ -6,9 +6,11 @@ const smsService   = require('../services/smsService');
 const config       = require('../config');
 const otpStore     = require('../utils/otpStore');
 const callSession  = require('../utils/callSession');
+const callLogger   = require('../utils/callLogger');
 const topicBuffer  = require('../utils/topicBuffer');
 const { normalize: normalizePhone } = require('../utils/phoneUtils');
-const logger       = require('../utils/logger');
+const logger             = require('../utils/logger');
+const resolvePackageRef  = require('../utils/resolvePackageRef');
 
 // ── Country list cache ────────────────────────────────────────────────────────
 // Loaded once from DB, refreshed every hour. Used to match destination names
@@ -149,6 +151,10 @@ class VapiController {
           .slice(-3);
 
         if (userTexts.length > 0) {
+          // Always keep the most recent user utterance — used for package reference resolution
+          const lastText = userTexts[userTexts.length - 1];
+          if (lastText) callSession.merge(sessionKey, { lastUserText: lastText });
+
           // ── Destination capture ─────────────────────────────────────────────
           if (existingConf !== 'high') {
             const countries = await getCachedCountries();
@@ -203,17 +209,32 @@ class VapiController {
           call_status:     'completed',
         }).catch(() => {}); // already closed — that's fine
       }
+
+      // Flush per-call JSON log. Vapi doesn't reliably send a call-start event,
+      // so start the logger here if it wasn't already started by another path.
+      if (twilioSid) {
+        if (!callLogger.has(twilioSid)) {
+          const s = callSession.get(twilioSid) || {};
+          callLogger.start(twilioSid, { phone: s.phone || 'unknown', direction: 'inbound', callId: s.callId || null });
+        }
+        callLogger.callEvent(twilioSid, 'vapi_end_of_call', { summary: summary?.substring(0, 200) || null, durationSeconds: duration });
+        await callLogger.flush(twilioSid, {
+          session: callSession.get(twilioSid),
+          summary: summary || null,
+        });
+      }
     }
 
     if (type === 'call-start') {
       const phone = message?.call?.customer?.number || null;
+      const normalizedPhone = normalizePhone(phone) || phone || 'unknown';
       logger.info('VAPI CALL STARTED', { twilioSid, vapiId, phone });
 
       // Create DB record (replaces handleIncomingCall when Vapi owns the number)
       if (twilioSid) {
         const record = await dbService.insertCallMaster({
           twilio_call_sid: twilioSid,
-          caller_phone:    normalizePhone(phone) || phone || 'unknown',
+          caller_phone:    normalizedPhone,
           called_phone:    message?.call?.phoneNumber?.number || config.TWILIO_PHONE_NUMBER,
           direction:       'inbound',
           vapi_call_id:    vapiId,
@@ -223,12 +244,15 @@ class VapiController {
         if (!callSession.has(sessionKey)) {
           callSession.set(sessionKey, {
             callId:     record?.CallID || null,
-            phone:      normalizePhone(phone) || phone,
+            phone:      normalizedPhone,
             callerType: 'unknown',
             isVerified: false,
             vapiCallId: vapiId,
           });
         }
+        // Start per-call JSON log (idempotent — skips if already started by Twilio webhook)
+        callLogger.start(twilioSid, { phone: normalizedPhone, direction: 'inbound', callId: record?.CallID || null });
+        callLogger.callEvent(twilioSid, 'call_started', { phone: normalizedPhone, vapiId });
         logger.info('Call record created via Vapi event', { callId: record?.CallID, twilioSid });
       }
     }
@@ -276,8 +300,25 @@ class VapiController {
             });
             logger.info('Session recovered from DB', { callSid: sessionKey, callId: record.CallID });
           } else {
-            // No DB record yet — seed a minimal session
-            callSession.set(sessionKey, { phone: callerPhone, callerType: 'unknown', isVerified: false });
+            // No DB record yet — auto-create one now (call-start event was likely missed)
+            const created = await dbService.insertCallMaster({
+              twilio_call_sid: twilioCallSid,
+              caller_phone:    callerPhone || 'unknown',
+              called_phone:    config.TWILIO_PHONE_NUMBER,
+              direction:       'inbound',
+              vapi_call_id:    vapiCallId,
+            }).catch(() => null);
+            callSession.set(sessionKey, {
+              callId:     created?.CallID || null,
+              phone:      callerPhone,
+              callerType: 'unknown',
+              isVerified: false,
+            });
+            if (created?.CallID) {
+              logger.info('Call record auto-created on first tool call', { callId: created.CallID, twilioSid: twilioCallSid });
+            } else {
+              logger.warn('Could not create call_master record on first tool call', { twilioSid: twilioCallSid });
+            }
           }
         } else {
           // Web/dashboard call — seed a minimal in-memory session (no DB record)
@@ -290,6 +331,12 @@ class VapiController {
         vapiCallId,
         ...(callerPhone && { phone: callerPhone }),
       });
+
+      // Start per-call JSON log on the first tool call if not already started
+      if (!callLogger.has(sessionKey)) {
+        const s = callSession.get(sessionKey) || {};
+        callLogger.start(sessionKey, { phone: s.phone || callerPhone || 'unknown', direction: 'inbound', callId: s.callId || null });
+      }
     }
 
     const toolCallList = message.toolCallList || [];
@@ -326,6 +373,7 @@ class VapiController {
           Object.entries(params).filter(([k]) => !k.startsWith('_'))
         );
         logger.info(`  >> ${name}  params=${JSON.stringify(logParams)}`);
+        callLogger.toolCall(sessionKey, name, logParams);
 
         // Inject server-side call context — tools don't need AI to pass these.
         // _twilioCallSid is the unified session key (vapiCallId for web calls).
@@ -334,10 +382,11 @@ class VapiController {
         params._callerPhone    = callerPhone;
         // Last thing the user said — used by getPackageItinerary to let the LLM
         // self-correct when pkgId is omitted (LLM receives package list + user text
-        // and retries with the correct pkgId instead of server-side text matching).
+        // and retries with the correct pkgId instead of server-wide text matching).
         const lastUserMsg = conversationMessages.filter(m => m.role === 'user').slice(-1)[0];
         params._lastUserText = lastUserMsg?.content || lastUserMsg?.message || '';
 
+        const t0 = Date.now();
         let result;
         try {
           result = await this._dispatch(name, params);
@@ -345,12 +394,16 @@ class VapiController {
           logger.error(`  !! ${name} THREW: ${err.message}`);
           result = { success: false, error: err.message, _ctx: this._buildCtx(sessionKey) };
         }
+        const durationMs = Date.now() - t0;
 
         const ok = result?.success === true ? 'OK' : 'FAIL';
         const preview = result?.message
           ? result.message.substring(0, 100).replace(/\n/g, ' ')
           : (result?.error || JSON.stringify(result).substring(0, 100));
-        logger.info(`  << ${name}  [${ok}]  ${preview}`);
+        logger.info(`  << ${name}  [${ok}]  ${durationMs}ms  ${preview}`);
+
+        callLogger.toolResponse(sessionKey, name, result, durationMs);
+        callLogger.sessionSnap(sessionKey, callSession.get(sessionKey) || {});
 
         return { toolCallId: id, result: JSON.stringify(result) };
       })
@@ -379,6 +432,7 @@ class VapiController {
       case 'scheduleCallback':       return this._scheduleCallback(params);
       case 'transferToHuman':        return this._transferToHuman(params);
       case 'saveLead':               return this._saveLead(params);
+      case 'saveBookingEnquiry':     return this._saveBookingEnquiry(params);
       case 'sendBookingLink':        return this._sendBookingLink(params);
       case 'sendPaymentLink':        return this._sendPaymentLink(params);
       case 'sendRegistrationLink':   return this._sendRegistrationLink(params);
@@ -406,6 +460,7 @@ class VapiController {
       verified:    s.isVerified  || false,
       destination: s.destination || null,
       callId:      s.callId      || null,
+      totalCalls:  s.totalCalls  ?? 0,
     };
   }
 
@@ -451,7 +506,7 @@ class VapiController {
     if (registry && registry.IsVerified && registry.CustomerType === 'agent') {
       await dbService.updateCallerRegistry({ phone: lookupPhone });
       if (_twilioCallSid) {
-        callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'agent_verified', agentId: registry.AgentID, name: registry.CallerName, email: registry.CallerEmail, isVerified: true });
+        callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'agent_verified', agentId: registry.AgentID, name: registry.CallerName, email: registry.CallerEmail, isVerified: true, totalCalls: registry.TotalCalls || 0 });
         await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'agent_verified', agent_id: registry.AgentID, caller_name: registry.CallerName, caller_email: registry.CallerEmail });
       }
       return {
@@ -557,12 +612,45 @@ class VapiController {
     const flushed = await topicBuffer.flush(_twilioCallSid);
     if (flushed > 0) logger.info(`saveCallSummary: flushed ${flushed} buffered topic entries`, { callSid: _twilioCallSid });
 
+    // If enquiry was saved in memory but details were never sent, persist to DB now
+    const sess = callSession.get(_twilioCallSid) || {};
+    if (sess.enquirySaved && !sess.packageDetailsSent) {
+      const req = sess.requirements || {};
+      await dbService.updateCallTopic({
+        twilio_call_sid: _twilioCallSid,
+        topic_name:  'new_booking',
+        topic_entry: {
+          ts:                  new Date().toISOString(),
+          destination:         req.destination        || sess.destination  || null,
+          pax:                 req.pax                || null,
+          durationDays:        req.durationDays        || null,
+          budgetPerPerson:     req.budgetPerPerson     || null,
+          tripType:            req.tripType            || null,
+          specialRequirements: req.specialRequirements || null,
+          packagesShown:       (sess.filteredPackages || []).map(p => ({ rank: p.rank ?? null, pkgId: p.pkgId, title: p.title })),
+          packageCount:        (sess.filteredPackages || []).length,
+          noPackageFound:      !!sess.noPackageFound,
+          customRequirements:  sess.customRequirements || null,
+          additionalNotes:     sess.additionalNotes    || null,
+          detailsSent:         false,
+          sentVia:             [],
+        },
+      }).catch(err => logger.warn('saveCallSummary: enquiry fallback write failed', { err: err.message }));
+    }
+
     await dbService.closeCallMaster({
       twilio_call_sid: _twilioCallSid,
       call_summary:    summary    || null,
       call_status:     'completed',
       is_resolved:     isResolved ?? null,
     });
+
+    // Flush the per-call JSON log file now that we have the summary and final session state.
+    await callLogger.flush(_twilioCallSid, {
+      session: callSession.get(_twilioCallSid),
+      summary: summary || null,
+    });
+
     return { success: true, message: 'Call summary saved.' };
   }
 
@@ -830,30 +918,43 @@ class VapiController {
     logger.info(`  getPackages: resolved  dest="${matchedCountryName}"  code="${code}"`);
     if (_twilioCallSid) callSession.merge(_twilioCallSid, { destination: matchedCountryName, countryCode: code });
 
-    const packages = await dbService.getPackagesByCountry(code, agentId || null);
+    // Return cached packages if already fetched for this destination this call —
+    // avoids a DB round-trip when LLM calls getPackages again on the "show nearest" fallback path.
+    const sessForCache = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    let packages;
+    if (Array.isArray(sessForCache.lastPackages) && sessForCache.lastPackages.length > 0) {
+      packages = sessForCache.lastPackages;
+      logger.info(`  getPackages: cache hit — returning ${packages.length} packages from session`);
+    } else {
+      packages = await dbService.getPackagesByCountry(code, agentId || null);
+      if (_twilioCallSid) callSession.merge(_twilioCallSid, { lastPackages: packages });
+    }
 
     if (packages.length === 0) {
       return {
         success: true, count: 0,
+        noPackageFound: true,
         _ctx: this._buildCtx(_twilioCallSid),
-        message: `We don't have active packages for that destination right now. Shall I schedule a callback so our team can provide personalised options?`,
+        message: `[INTERNAL — do NOT say this to the caller] No standard packages currently listed for "${matchedCountryName}". INSTRUCTION: Do NOT tell the caller we have no packages. Instead say something like "We have some great options for ${matchedCountryName}! Let me note your requirements so I can put together the best fit for you." Then ask all 4 requirements (pax, days, budget, tripType) one at a time. Once collected, call saveBookingEnquiry({ requirements: { destination: "${matchedCountryName}", pax, durationDays, budgetPerPerson, tripType, specialRequirements }, selectedPackages: [], noPackageFound: true, customRequirements: "<any specific needs the caller mentions>" }).`,
       };
     }
 
-    const topPackages = packages.slice(0, 6);
+    // Pass up to 20 compact entries to LLM for filtering; full objects already in session
+    const forLLM = packages.slice(0, 20);
+    const sess   = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const reqSummary = sess.requirements && Object.keys(sess.requirements).length > 0
+      ? `Requirements already in session: ${JSON.stringify(sess.requirements)}`
+      : 'Requirements not yet collected — ask the caller next.';
 
-    // Cache in session so sendPackageDetails can use them without GPT-4o re-passing them
-    if (_twilioCallSid) callSession.merge(_twilioCallSid, { lastPackages: topPackages });
-
-    const summary = packages.slice(0, 4).map((pkg, i) => {
+    const packageList = forLLM.map((pkg, i) => {
       const firstDate = pkg.availableDates[0]?.date || 'TBD';
-      return `${i + 1}. [pkgId=${pkg.pkgId}] ${pkg.title} — ${pkg.durationDays} days, next: ${firstDate}`;
+      return `${i + 1}. pkgId=${pkg.pkgId} | ${pkg.title} | ${pkg.durationDays} days | next: ${firstDate}`;
     }).join('\n');
 
     return {
-      success: true, count: packages.length, packages: topPackages,
+      success: true, count: packages.length, packages: forLLM,
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `Here are the available packages (pkgId is required for getPackageItinerary):\n\n${summary}\n\nTo get day-wise details call getPackageItinerary({ pkgId: <number above> }).`,
+      message: `${packages.length} package(s) available for ${matchedCountryName}.\n\n${packageList}\n\n${reqSummary}\n\nINSTRUCTION:\n1. If any of the 4 requirements (pax, durationDays, budgetPerPerson, tripType) are missing, ask the caller one at a time — do not call any tool between questions.\n2. Once all 4 requirements are known, score ALL packages above against those requirements (duration fit, budget fit, trip type match, group size) and pick the TOP 3. Order them rank 1 (best match), rank 2, rank 3 — this order is what the caller will hear.\n3. Call saveBookingEnquiry BEFORE presenting anything to the caller:\n   saveBookingEnquiry({ requirements: { destination, pax, durationDays, budgetPerPerson, tripType }, selectedPackages: [<rank-1 package object>, <rank-2 package object>, <rank-3 package object>] })\n   Pass the full package objects from the list above in ranked order. Do NOT modify or summarise them.\n4. After saveBookingEnquiry succeeds, present only those 3 to the caller as "first option", "second option", "third option" — name and duration only. Do NOT say "rank" or package IDs to the caller.`,
     };
   }
 
@@ -861,28 +962,44 @@ class VapiController {
 
   async _getPackageItinerary({ pkgId, _twilioCallSid, _lastUserText }) {
     if (!pkgId && _twilioCallSid) {
-      const sess = callSession.get(_twilioCallSid) || {};
-      if (sess.lastPackages?.length) {
-        // pkgId was omitted by the LLM — give it back everything it needs to self-correct:
-        // the package list with pkgIds + what the user just said, then ask it to retry.
-        const list = sess.lastPackages
-          .map((p, i) => `${i + 1}. pkgId=${p.pkgId}  "${p.title}" — ${p.durationDays} days`)
+      const sess      = callSession.get(_twilioCallSid) || {};
+      const shownPkgs = sess.filteredPackages?.length
+        ? sess.filteredPackages
+        : (sess.lastPackages || []).slice(0, 3);
+
+      // Prefer _lastUserText injected from the Vapi tool-call payload (bound to this
+      // exact turn) over sess.lastUserText (from the last conversation-update event,
+      // which may be from a different turn).
+      const userText = _lastUserText || sess.lastUserText || '';
+
+      if (shownPkgs.length && userText) {
+        // Try to resolve what the user said → pkgId without asking LLM to retry
+        const resolved = await resolvePackageRef(userText, shownPkgs);
+        if (resolved) {
+          logger.info(`  getPackageItinerary: resolved pkgId=${resolved} from "${userText}"`);
+          pkgId = resolved; // fall through to normal fetch below
+        }
+      }
+
+      if (!pkgId) {
+        // Backend couldn't resolve — give Vapi LLM the user's exact words + package list
+        // so it can identify the pkgId and call getPackageItinerary again with it.
+        const pkgList = shownPkgs
+          .map((p, i) => `${i + 1}. pkgId=${p.pkgId} — "${p.title}" (${p.durationDays} days)`)
           .join('\n');
-        logger.info(`  getPackageItinerary: pkgId missing — returning package list + user text for LLM to resolve`);
+        const userSaid = userText || '(not captured)';
+        logger.info(`  getPackageItinerary: backend could not resolve — sending to Vapi LLM  userText="${userSaid}"`);
         return {
           success: false,
           requiresRetry: true,
-          availablePackages: sess.lastPackages.map(p => ({ pkgId: p.pkgId, title: p.title, durationDays: p.durationDays })),
           _ctx: this._buildCtx(_twilioCallSid),
-          message: `pkgId is required but was not provided. The user said: "${_lastUserText || '(not captured)'}". Here are the available packages:\n${list}\n\nBased on what the user said, determine which package they mean and call getPackageItinerary again with that pkgId.`,
+          message: `The caller said: "${userSaid}"\n\nPackages shown to them:\n${pkgList}\n\nIdentify which package the caller is referring to and call getPackageItinerary again with the correct pkgId. If you genuinely cannot tell, ask the caller: "Could you say first, second, or third — or the package name?"`,
         };
       }
     }
+
     if (!pkgId) {
-      return {
-        success: false, error: 'pkgId is required. Call getPackages first to get the list.',
-        _ctx: this._buildCtx(_twilioCallSid),
-      };
+      return { success: false, error: 'pkgId is required. Call getPackages first.', _ctx: this._buildCtx(_twilioCallSid) };
     }
 
     const itinerary = await dbService.getPackageItinerary(pkgId);
@@ -890,11 +1007,14 @@ class VapiController {
       return { success: true, itinerary: [], _ctx: this._buildCtx(_twilioCallSid), message: 'Full itinerary is in the PDF. Shall I send it to you?' };
     }
 
-    const summary = itinerary.map((d) => `Day ${d.PKG_ITI_DAY}: ${d.PKG_ITI_TITLE}`).join('\n');
+    const summary  = itinerary.map((d) => `Day ${d.PKG_ITI_DAY}: ${d.PKG_ITI_TITLE}`).join('\n');
+    const sess2    = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const isKnown  = sess2.callerType && sess2.callerType !== 'unknown' && sess2.callerType !== 'new_customer';
+    const channels = isKnown ? 'email or SMS' : 'SMS';
     return {
       success: true, itinerary,
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `Day-wise overview:\n\n${summary}\n\nShall I send the full PDF itinerary to your email?`,
+      message: `Day-wise overview:\n\n${summary}\n\nWould you like me to send the full PDF itinerary to your ${channels}?`,
     };
   }
 
@@ -903,10 +1023,17 @@ class VapiController {
   async _sendPackageDetails({ phone, email, customerName, packages, agentId, _twilioCallSid, _callerPhone }) {
     const session = _twilioCallSid ? callSession.get(_twilioCallSid) : {};
 
-    // GPT-4o often omits the packages array — fall back to the ones fetched in this session.
+    // If saveBookingEnquiry was never called, auto-save with best-effort top-3 so the
+    // send can still proceed — the LLM presented packages verbally, we just backfill the record.
+    if (!session.enquirySaved && session.lastPackages?.length > 0 && !(Array.isArray(packages) && packages.length > 0)) {
+      const top3 = session.lastPackages.slice(0, 3).map((p, i) => ({ ...p, rank: i + 1 }));
+      if (_twilioCallSid) callSession.merge(_twilioCallSid, { filteredPackages: top3, enquirySaved: true });
+    }
+
+    // Prefer explicit packages passed by LLM, then filtered top-3, then last-resort lastPackages slice.
     const resolvedPackages = (Array.isArray(packages) && packages.length > 0)
       ? packages
-      : (session.lastPackages || []);
+      : (session.filteredPackages?.length ? session.filteredPackages : (session.lastPackages || []).slice(0, 3));
 
     if (!resolvedPackages || resolvedPackages.length === 0) {
       return { success: false, error: 'No packages to send. Call getPackages first, then sendPackageDetails with the results.', _ctx: this._buildCtx(_twilioCallSid) };
@@ -942,11 +1069,37 @@ class VapiController {
     }
 
     const sent = channels.length > 0;
+    if (sent && _twilioCallSid) {
+      callSession.merge(_twilioCallSid, { packageDetailsSent: true, sentVia: channels });
+      // Write full enquiry record to DB now that caller has confirmed interest
+      const s   = callSession.get(_twilioCallSid) || {};
+      const req = s.requirements || {};
+      dbService.updateCallTopic({
+        twilio_call_sid: _twilioCallSid,
+        topic_name:  'new_booking',
+        topic_entry: {
+          ts:                  new Date().toISOString(),
+          destination:         req.destination        || s.destination  || null,
+          pax:                 req.pax                || null,
+          durationDays:        req.durationDays        || null,
+          budgetPerPerson:     req.budgetPerPerson     || null,
+          tripType:            req.tripType            || null,
+          specialRequirements: req.specialRequirements || null,
+          packagesShown:       resolvedPackages.map(p => ({ rank: p.rank ?? null, pkgId: p.pkgId, title: p.title })),
+          packageCount:        resolvedPackages.length,
+          noPackageFound:      !!s.noPackageFound,
+          customRequirements:  s.customRequirements || null,
+          additionalNotes:     s.additionalNotes    || null,
+          detailsSent:         true,
+          sentVia:             channels,
+        },
+      }).catch(err => logger.warn('sendPackageDetails: topic update failed', { err: err.message }));
+    }
     return {
       success: sent, channelsSent: channels,
       _ctx: this._buildCtx(_twilioCallSid),
       message: sent
-        ? `Package details sent to your ${channels.join(' and ')}. Our team will follow up shortly. Anything else?`
+        ? `Package details sent via ${channels.join(' and ')}. Our team will follow up. Anything else?`
         : `Unable to send details. ${errors.join(' ')} Please try again.`,
     };
   }
@@ -995,6 +1148,90 @@ class VapiController {
       success: true,
       _ctx: this._buildCtx(_twilioCallSid),
       message: `Thank you${name ? ' ' + name : ''}! I've noted your enquiry for ${destination || 'your trip'}. Our sales team will reach out at ${leadPhone}. Anything else?`,
+    };
+  }
+
+  // ── Tool: saveBookingEnquiry ──────────────────────────────────────────────
+
+  async _saveBookingEnquiry({ requirements, selectedPackages, selectedPkgIds, noPackageFound, customRequirements, additionalNotes, _twilioCallSid, _callerPhone }) {
+    const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+
+    // Resolve packages: prefer full objects passed by LLM, fall back to pkgId lookup from session
+    let resolvedPackages = [];
+    if (Array.isArray(selectedPackages) && selectedPackages.length > 0) {
+      resolvedPackages = selectedPackages.slice(0, 3);
+    } else if (Array.isArray(selectedPkgIds) && selectedPkgIds.length > 0 && Array.isArray(session.lastPackages)) {
+      resolvedPackages = session.lastPackages.filter(p => selectedPkgIds.includes(p.pkgId)).slice(0, 3);
+    }
+
+    const req = requirements || {};
+
+    // Attach rank (1=best, 2, 3) based on order LLM passed them in
+    resolvedPackages = resolvedPackages.map((p, i) => ({ ...p, rank: i + 1 }));
+
+    // Save to in-memory session only — DB write happens in sendPackageDetails or saveCallSummary
+    if (_twilioCallSid) {
+      callSession.merge(_twilioCallSid, {
+        requirements:       req,
+        filteredPackages:   resolvedPackages,
+        noPackageFound:     !!noPackageFound,
+        hasCustomRequest:   !!(noPackageFound || customRequirements),
+        customRequirements: customRequirements || null,
+        additionalNotes:    additionalNotes    || null,
+        enquirySaved:       true,
+        destination:        req.destination || session.destination || null,
+      });
+    }
+
+    // Defensive: treat as noPackageFound if LLM passed empty packages but all packages in session are also empty
+    const effectiveNoPackage = !!noPackageFound
+      || (resolvedPackages.length === 0 && !customRequirements && (session.lastPackages?.length ?? 1) === 0);
+
+    // 3. Auto-schedule callback when no packages found or caller has custom requirements
+    if (effectiveNoPackage || customRequirements) {
+      const callbackPhone = _callerPhone || session.phone || null;
+      if (callbackPhone) {
+        const reasonParts = [
+          `Custom package request — ${req.destination || 'destination unknown'}`,
+          req.pax             ? `Pax: ${req.pax}`                      : null,
+          req.durationDays    ? `Days: ${req.durationDays}`             : null,
+          req.budgetPerPerson ? `Budget: ${req.budgetPerPerson}`        : null,
+          req.tripType        ? `Type: ${req.tripType}`                 : null,
+          customRequirements  ? `Custom needs: ${customRequirements}`   : null,
+        ].filter(Boolean).join(' | ');
+
+        await dbService.scheduleCallback({
+          phone:      callbackPhone,
+          call_id:    session.callId || null,
+          reason:     reasonParts,
+          department: 'sales',
+          priority:   2,
+        });
+      }
+
+      return {
+        success:           true,
+        enquirySaved:      true,
+        callbackScheduled: true,
+        noPackageFound:    effectiveNoPackage,
+        _ctx: this._buildCtx(_twilioCallSid),
+        message: effectiveNoPackage
+          ? `Enquiry saved and callback scheduled. Tell the caller: "We're working on some exciting options for you! Our team will put together a customised package based on your requirements and get in touch with you very soon. Is there anything specific you'd like us to include — like particular hotels, activities, or travel dates?"`
+          : `Custom requirements saved and callback scheduled. Tell the caller: "Noted! Our team will create a personalised package for you and be in touch soon. Is there anything else I can help you with?"`,
+      };
+    }
+
+    const rankedList = resolvedPackages
+      .map(p => `Rank ${p.rank}: pkgId=${p.pkgId}  "${p.title}" — ${p.durationDays} days`)
+      .join('\n');
+
+    return {
+      success:          true,
+      enquirySaved:     true,
+      packagesSelected: resolvedPackages.length,
+      packages:         resolvedPackages,
+      _ctx: this._buildCtx(_twilioCallSid),
+      message: `Enquiry saved. Ranked packages (1=best match):\n${rankedList}\n\nNow do the following in order:\n1. Present only the names and durations: "I have 3 great options for you — [name1] for [N] days, [name2] for [N] days, and [name3] for [N] days."\n2. Ask: "Would you like me to explain any of these in detail, or shall I send all the details to your phone?"\n3. If caller wants explanation → ask "Which one?" → wait for reply → call getPackageItinerary.\n4. If caller wants details sent → ${resolvedPackages.length > 0 ? `ask for their ${['agent_verified','existing_customer'].includes((callSession.get(_twilioCallSid) || {}).callerType) ? 'email or phone number for SMS' : 'phone number for SMS'}` : 'ask for their phone number for SMS'} → call sendPackageDetails.\nDo NOT call sendPackageDetails before the caller confirms they want to receive it.`,
     };
   }
 

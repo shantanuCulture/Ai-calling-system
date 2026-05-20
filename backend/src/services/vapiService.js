@@ -27,6 +27,28 @@ class VapiService {
     return res.data;
   }
 
+  async updateAssistant(assistantId, patch) {
+    const res = await vapiClient.patch(`/assistant/${assistantId}`, patch);
+    logger.info(`Vapi assistant updated`, { assistantId, fields: Object.keys(patch) });
+    return res.data;
+  }
+
+  // Sync the voice on every assistant in a squad to a single voice config.
+  // voiceConfig: { provider: '11labs', voiceId: '...' }
+  async syncSquadVoice(squadId, voiceConfig) {
+    const squadRes  = await vapiClient.get(`/squad/${squadId}`);
+    const members   = squadRes.data?.members || [];
+    const results   = [];
+    for (const m of members) {
+      const id = m.assistantId || m.assistant?.id;
+      if (!id) continue;
+      const updated = await this.updateAssistant(id, { voice: voiceConfig });
+      results.push({ id, name: updated.name });
+    }
+    logger.info(`syncSquadVoice: updated ${results.length} assistants`, { voiceConfig });
+    return results;
+  }
+
   async getCall(callId) {
     const res = await vapiClient.get(`/call/${callId}`);
     return res.data;
