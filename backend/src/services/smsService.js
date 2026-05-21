@@ -9,13 +9,10 @@ const logger = require('../utils/logger');
 const sendPackageSMS = async ({ to, customerName, packages }) => {
   const client = getTwilioClient();
 
-  // TRIAL ACCOUNT WORKAROUND: send only the first package with its PDF link
-  // so the message stays under 160 chars and passes carrier filters.
-  // TODO: remove this limit on live — send all packages with links.
   const pkg = packages[0];
   const pdf = pkg?.availableDates?.[0]?.pdfUrl || pkg?.availableDates?.[0]?.bookingLink || null;
   const linkPart = pdf ? ` ${pdf}` : '';
-  const body = `Culture Holidays package for ${customerName || 'you'}: ${pkg?.title} (${pkg?.durationDays}D).${linkPart}`;
+  const body = `Culture Holidays: ${pkg?.title} (${pkg?.durationDays}D).${linkPart}`;
 
   const msg = await client.messages.create({
     to,

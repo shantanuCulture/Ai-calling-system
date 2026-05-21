@@ -1358,7 +1358,7 @@ class VapiController {
       success:          true,
       enquirySaved:     true,
       packagesSelected: resolvedPackages.length,
-      packages:         resolvedPackages,
+      packages:         resolvedPackages.map(p => ({ pkgId: p.pkgId, title: p.title, durationDays: p.durationDays, matchType: p.matchType, rank: p.rank })),
       matchIntro,
       _ctx: this._buildCtx(_twilioCallSid),
       message: `Enquiry saved. Present EXACTLY these 3 packages — do not substitute:\n\n${rankedList}\n\nSpeak this script word for word:\n1. "${matchIntro}"\n2. "First option: [name1], [N] days. Second option: [name2], [N] days. Third option: [name3], [N] days."\n3. ${exactCount === 0 ? '"If none of these feel quite right, I can also arrange a callback from one of our destination experts who can build a custom itinerary for you."\n4. ' : ''}"Would you like me to explain any of these packages in detail, or shall I send the full itinerary to your phone via SMS?"\n\nIf caller wants one explained → ask "Which one — first, second, or third?" → call getPackageItinerary with that package's pkgId.\nIf caller wants details sent → ask for their ${sendChannel} → call sendPackageDetails.\nIf caller wants a callback → call scheduleCallback.\nDo NOT call sendPackageDetails before the caller confirms.`,
