@@ -107,6 +107,70 @@ function matchCountry(text, countries) {
   return null;
 }
 
+// ── Server-side requirement extraction ────────────────────────────────────────
+// GPT-4o sometimes calls saveBookingEnquiry({}) with no params. We recover
+// requirements by scanning the last 15 user messages from the conversation
+// history that Vapi injects with every tool call.
+function _extractRequirementsFromConversation(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return {};
+  const text = messages
+    .filter(m => m.role === 'user')
+    .slice(-15)
+    .map(m => (m.content || m.message || '').toLowerCase())
+    .join(' ');
+
+  const result = {};
+
+  const paxM = text.match(/\b(\d{1,2})\s*(?:people|persons?|pax|travelers?|travellers?|passengers?|adults?|guests?|members?)\b/);
+  if (paxM) result.pax = parseInt(paxM[1], 10);
+
+  const daysM = text.match(/\b(\d{1,2})\s*(?:days?|nights?)\b/);
+  if (daysM) result.durationDays = parseInt(daysM[1], 10);
+
+  const budgetM = text.match(/\b(\d{3,6})\s*(?:dollars?|usd|\$|rupees?|inr|pounds?|gbp|per person)?\b/);
+  if (budgetM) result.budgetPerPerson = budgetM[1];
+
+  if      (text.includes('honeymoon')) result.tripType = 'honeymoon';
+  else if (text.includes('family'))    result.tripType = 'family';
+  else if (text.includes('adventure')) result.tripType = 'adventure';
+  else if (text.includes('luxury'))    result.tripType = 'luxury';
+  else if (text.includes('solo'))      result.tripType = 'solo';
+  else if (text.includes('group'))     result.tripType = 'group';
+
+  return result;
+}
+
+// ── Server-side package matching ──────────────────────────────────────────────
+// Primary flow: AI passes requirements, server picks top 3 with match quality.
+// matchType: 'exact' (±0 days) | 'similar' (±2 days) | 'recommendation' (beyond)
+function _scorePackages(packages, requirements) {
+  const { durationDays, tripType } = requirements;
+  return [...packages]
+    .map(pkg => {
+      let score = 1000;
+      let matchType = 'recommendation';
+
+      if (durationDays && pkg.durationDays) {
+        const diff = Math.abs(pkg.durationDays - durationDays);
+        if (diff === 0)      { score += 200; matchType = 'exact'; }
+        else if (diff <= 2)  { score += 120; matchType = 'similar'; }
+        else if (diff <= 4)  { score += 60; }
+        else                 { score -= diff * 10; }
+      }
+
+      if (tripType) {
+        const t = (pkg.title || '').toLowerCase();
+        if (tripType === 'honeymoon' && (t.includes('honey') || t.includes('romance'))) score += 40;
+        if (tripType === 'luxury'    && (t.includes('luxe')  || t.includes('luxury')))  score += 40;
+        if (tripType === 'family'    && t.includes('family'))                            score += 40;
+        if (tripType === 'adventure' && t.includes('adventure'))                         score += 40;
+      }
+
+      return { ...pkg, _score: score, matchType };
+    })
+    .sort((a, b) => b._score - a._score);
+}
+
 class VapiController {
 
   // ── Vapi phone-number event webhook ───────────────────────────────────────
@@ -241,15 +305,16 @@ class VapiController {
         }).catch(() => null); // idempotent — ignore if already exists
 
         const sessionKey = twilioSid;
-        if (!callSession.has(sessionKey)) {
-          callSession.set(sessionKey, {
-            callId:     record?.CallID || null,
-            phone:      normalizedPhone,
-            callerType: 'unknown',
-            isVerified: false,
-            vapiCallId: vapiId,
-          });
-        }
+        // Merge so destination/lastUserText captured by earlier conversation-update events survive.
+        // _dbInitialized prevents the tool-call handler from running a redundant DB lookup.
+        callSession.merge(sessionKey, {
+          callId:         record?.CallID || null,
+          phone:          normalizedPhone,
+          callerType:     'unknown',
+          isVerified:     false,
+          vapiCallId:     vapiId,
+          _dbInitialized: true,
+        });
         // Start per-call JSON log (idempotent — skips if already started by Twilio webhook)
         callLogger.start(twilioSid, { phone: normalizedPhone, direction: 'inbound', callId: record?.CallID || null });
         callLogger.callEvent(twilioSid, 'call_started', { phone: normalizedPhone, vapiId });
@@ -284,19 +349,25 @@ class VapiController {
     const sessionKey = twilioCallSid || vapiCallId;
 
     if (sessionKey) {
-      if (!callSession.has(sessionKey)) {
+      // conversation-update events can pre-create the session via callSession.merge() before any
+      // tool call fires, leaving it without callId/callerType/_dbInitialized. Guard against that
+      // by checking _dbInitialized rather than just has() — so the DB lookup/auto-create still
+      // runs on the first *tool call* even if the session entry already exists from event parsing.
+      const existingSession = callSession.get(sessionKey);
+      if (!existingSession._dbInitialized) {
         if (twilioCallSid) {
           // Real phone call — try to recover session from DB first
           const record = await dbService.getCallByTwilioSID(twilioCallSid);
           if (record) {
-            callSession.set(sessionKey, {
-              callId:     record.CallID,
-              phone:      normalizePhone(record.CallerPhone) || record.CallerPhone,
-              callerType: record.CallerStatus || 'unknown',
-              agentId:    record.AgentID    || null,
-              name:       record.CallerName || null,
-              email:      record.CallerEmail || null,
-              isVerified: record.CallerStatus === 'agent_verified',
+            callSession.merge(sessionKey, {
+              callId:          record.CallID,
+              phone:           normalizePhone(record.CallerPhone) || record.CallerPhone,
+              callerType:      record.CallerStatus || 'unknown',
+              agentId:         record.AgentID    || null,
+              name:            record.CallerName || null,
+              email:           record.CallerEmail || null,
+              isVerified:      record.CallerStatus === 'agent_verified',
+              _dbInitialized:  true,
             });
             logger.info('Session recovered from DB', { callSid: sessionKey, callId: record.CallID });
           } else {
@@ -308,11 +379,12 @@ class VapiController {
               direction:       'inbound',
               vapi_call_id:    vapiCallId,
             }).catch(() => null);
-            callSession.set(sessionKey, {
-              callId:     created?.CallID || null,
-              phone:      callerPhone,
-              callerType: 'unknown',
-              isVerified: false,
+            callSession.merge(sessionKey, {
+              callId:         created?.CallID || null,
+              phone:          callerPhone,
+              callerType:     'unknown',
+              isVerified:     false,
+              _dbInitialized: true,
             });
             if (created?.CallID) {
               logger.info('Call record auto-created on first tool call', { callId: created.CallID, twilioSid: twilioCallSid });
@@ -322,7 +394,7 @@ class VapiController {
           }
         } else {
           // Web/dashboard call — seed a minimal in-memory session (no DB record)
-          callSession.set(sessionKey, { phone: callerPhone, callerType: 'unknown', isVerified: false, webCall: true });
+          callSession.merge(sessionKey, { phone: callerPhone, callerType: 'unknown', isVerified: false, webCall: true, _dbInitialized: true });
           logger.info('Web call session created', { sessionKey });
         }
       }
@@ -385,6 +457,9 @@ class VapiController {
         // and retries with the correct pkgId instead of server-wide text matching).
         const lastUserMsg = conversationMessages.filter(m => m.role === 'user').slice(-1)[0];
         params._lastUserText = lastUserMsg?.content || lastUserMsg?.message || '';
+        // Full user conversation — used by saveBookingEnquiry to extract requirements
+        // server-side when GPT-4o omits them from the function call params.
+        params._conversationMessages = conversationMessages;
 
         const t0 = Date.now();
         let result;
@@ -939,22 +1014,23 @@ class VapiController {
       };
     }
 
-    // Pass up to 20 compact entries to LLM for filtering; full objects already in session
-    const forLLM = packages.slice(0, 20);
-    const sess   = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
-    const reqSummary = sess.requirements && Object.keys(sess.requirements).length > 0
-      ? `Requirements already in session: ${JSON.stringify(sess.requirements)}`
-      : 'Requirements not yet collected — ask the caller next.';
+    // Send the LLM a compact reference list — title + durationDays only (no dates).
+    // Full package objects stay in session.lastPackages for server-side matching.
+    // The AI does NOT score packages — server handles that in saveBookingEnquiry.
+    const forLLM = packages.slice(0, 30).map(pkg => ({
+      pkgId:        pkg.pkgId,
+      title:        pkg.title,
+      durationDays: pkg.durationDays,
+    }));
 
-    const packageList = forLLM.map((pkg, i) => {
-      const firstDate = pkg.availableDates[0]?.date || 'TBD';
-      return `${i + 1}. pkgId=${pkg.pkgId} | ${pkg.title} | ${pkg.durationDays} days | next: ${firstDate}`;
-    }).join('\n');
+    const packageList = forLLM.map((pkg, i) =>
+      `${i + 1}. pkgId=${pkg.pkgId} | ${pkg.title} | ${pkg.durationDays} days`
+    ).join('\n');
 
     return {
       success: true, count: packages.length, packages: forLLM,
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `${packages.length} package(s) available for ${matchedCountryName}.\n\n${packageList}\n\n${reqSummary}\n\nINSTRUCTION:\n1. If any of the 4 requirements (pax, durationDays, budgetPerPerson, tripType) are missing, ask the caller one at a time — do not call any tool between questions.\n2. Once all 4 requirements are known, score ALL packages above against those requirements (duration fit, budget fit, trip type match, group size) and pick the TOP 3. Order them rank 1 (best match), rank 2, rank 3 — this order is what the caller will hear.\n3. Call saveBookingEnquiry BEFORE presenting anything to the caller:\n   saveBookingEnquiry({ requirements: { destination, pax, durationDays, budgetPerPerson, tripType }, selectedPackages: [<rank-1 package object>, <rank-2 package object>, <rank-3 package object>] })\n   Pass the full package objects from the list above in ranked order. Do NOT modify or summarise them.\n4. After saveBookingEnquiry succeeds, present only those 3 to the caller as "first option", "second option", "third option" — name and duration only. Do NOT say "rank" or package IDs to the caller.`,
+      message: `${packages.length} package(s) available for ${matchedCountryName} (showing top ${forLLM.length}):\n\n${packageList}\n\nINSTRUCTION:\n1. Ask the caller the following one at a time (skip any already answered):\n   - How many people are travelling?\n   - How many days?\n   - Approximate budget per person?\n   - Type of trip: honeymoon, family, adventure, or luxury?\n2. Once you have all 4 answers, call saveBookingEnquiry with ONLY the requirements:\n   saveBookingEnquiry({ requirements: { destination: "${matchedCountryName}", pax: N, durationDays: N, budgetPerPerson: "...", tripType: "..." } })\n   Do NOT include selectedPkgIds — the server matches packages automatically.\n3. After saveBookingEnquiry succeeds, present the 3 packages it returns EXACTLY as given — name and duration only.`,
     };
   }
 
@@ -962,10 +1038,12 @@ class VapiController {
 
   async _getPackageItinerary({ pkgId, _twilioCallSid, _lastUserText }) {
     if (!pkgId && _twilioCallSid) {
-      const sess      = callSession.get(_twilioCallSid) || {};
-      const shownPkgs = sess.filteredPackages?.length
-        ? sess.filteredPackages
-        : (sess.lastPackages || []).slice(0, 3);
+      const sess = callSession.get(_twilioCallSid) || {};
+
+      // Use only the packages that were actually presented to the caller (ranked by LLM).
+      // Do NOT fall back to lastPackages.slice(0,3) — that is DB order, not presentation order,
+      // and would cause the wrong itinerary to be explained (e.g. 5-day pkg instead of 8-day).
+      const shownPkgs = sess.filteredPackages?.length ? sess.filteredPackages : [];
 
       // Prefer _lastUserText injected from the Vapi tool-call payload (bound to this
       // exact turn) over sess.lastUserText (from the last conversation-update event,
@@ -982,18 +1060,23 @@ class VapiController {
       }
 
       if (!pkgId) {
-        // Backend couldn't resolve — give Vapi LLM the user's exact words + package list
-        // so it can identify the pkgId and call getPackageItinerary again with it.
-        const pkgList = shownPkgs
+        // Backend couldn't resolve — give Vapi LLM the user's exact words + package list.
+        // If filteredPackages is empty (saveBookingEnquiry wasn't called properly), use lastPackages
+        // so the LLM can identify the correct pkgId and also call saveBookingEnquiry first.
+        const refPkgs = shownPkgs.length ? shownPkgs : (sess.lastPackages || []).slice(0, 20);
+        const pkgList = refPkgs
           .map((p, i) => `${i + 1}. pkgId=${p.pkgId} — "${p.title}" (${p.durationDays} days)`)
           .join('\n');
         const userSaid = userText || '(not captured)';
-        logger.info(`  getPackageItinerary: backend could not resolve — sending to Vapi LLM  userText="${userSaid}"`);
+        const noRanked = shownPkgs.length === 0 && refPkgs.length > 0;
+        logger.info(`  getPackageItinerary: backend could not resolve — sending to Vapi LLM  userText="${userSaid}"  noRankedPkgs=${noRanked}`);
         return {
           success: false,
           requiresRetry: true,
           _ctx: this._buildCtx(_twilioCallSid),
-          message: `The caller said: "${userSaid}"\n\nPackages shown to them:\n${pkgList}\n\nIdentify which package the caller is referring to and call getPackageItinerary again with the correct pkgId. If you genuinely cannot tell, ask the caller: "Could you say first, second, or third — or the package name?"`,
+          message: noRanked
+            ? `The caller said: "${userSaid}"\n\nWARNING: saveBookingEnquiry has not yet been called with selectedPkgIds, so no ranked list is stored.\n\nAll available packages:\n${pkgList}\n\nFirst, identify which package the caller wants, then:\n1. Call saveBookingEnquiry with selectedPkgIds: [chosen_pkgId, ...] (rank-order your top 3)\n2. Then call getPackageItinerary with the correct pkgId.`
+            : `The caller said: "${userSaid}"\n\nPackages shown to them:\n${pkgList}\n\nIdentify which package the caller is referring to and call getPackageItinerary again with the correct pkgId. If you genuinely cannot tell, ask the caller: "Could you say first, second, or third — or the package name?"`,
         };
       }
     }
@@ -1153,7 +1236,7 @@ class VapiController {
 
   // ── Tool: saveBookingEnquiry ──────────────────────────────────────────────
 
-  async _saveBookingEnquiry({ requirements, selectedPackages, selectedPkgIds, noPackageFound, customRequirements, additionalNotes, _twilioCallSid, _callerPhone }) {
+  async _saveBookingEnquiry({ requirements, selectedPackages, selectedPkgIds, noPackageFound, customRequirements, additionalNotes, _twilioCallSid, _callerPhone, _conversationMessages }) {
     const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
 
     // Resolve packages: prefer full objects passed by LLM, fall back to pkgId lookup from session
@@ -1161,10 +1244,36 @@ class VapiController {
     if (Array.isArray(selectedPackages) && selectedPackages.length > 0) {
       resolvedPackages = selectedPackages.slice(0, 3);
     } else if (Array.isArray(selectedPkgIds) && selectedPkgIds.length > 0 && Array.isArray(session.lastPackages)) {
-      resolvedPackages = session.lastPackages.filter(p => selectedPkgIds.includes(p.pkgId)).slice(0, 3);
+      // Coerce both sides to string so number/string mismatch from LLM never fails the lookup
+      const ids = selectedPkgIds.map(String);
+      // Preserve the ranked order the LLM specified
+      resolvedPackages = ids
+        .map(id => session.lastPackages.find(p => String(p.pkgId) === id))
+        .filter(Boolean)
+        .slice(0, 3);
     }
 
-    const req = requirements || {};
+    let req = requirements || {};
+
+    // When GPT-4o omits selectedPkgIds (and sometimes omits requirements entirely),
+    // do server-side scoring rather than returning a failure that breaks the call.
+    if (resolvedPackages.length === 0 && !noPackageFound && !customRequirements
+        && Array.isArray(session.lastPackages) && session.lastPackages.length > 0) {
+
+      // ── Extract requirements from conversation when model omitted them ──────
+      if (!req.destination && !req.pax && !req.durationDays) {
+        const extracted = _extractRequirementsFromConversation(_conversationMessages);
+        req = { destination: session.destination || null, ...extracted, ...req };
+        if (Object.keys(extracted).length > 0) {
+          logger.info(`  saveBookingEnquiry: extracted requirements from conversation  ${JSON.stringify(extracted)}`);
+        }
+      }
+
+      // ── Score all packages server-side and pick top 3 ─────────────────────
+      const ranked = _scorePackages(session.lastPackages, req);
+      resolvedPackages = ranked.slice(0, 3);
+      logger.warn(`  saveBookingEnquiry: pkgIds omitted — server-side scored top 3: ${resolvedPackages.map(p => p.pkgId).join(', ')}  sessionKey=${_twilioCallSid?.substring(0, 20)}`);
+    }
 
     // Attach rank (1=best, 2, 3) based on order LLM passed them in
     resolvedPackages = resolvedPackages.map((p, i) => ({ ...p, rank: i + 1 }));
@@ -1221,8 +1330,28 @@ class VapiController {
       };
     }
 
+    const sess3 = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const isKnownCaller = ['agent_verified', 'existing_customer'].includes(sess3.callerType);
+    const sendChannel = isKnownCaller ? 'email or phone number for SMS' : 'phone number for SMS';
+
+    // ── Build match-aware intro so AI tells the caller honestly what was found ──
+    const exactCount  = resolvedPackages.filter(p => p.matchType === 'exact').length;
+    const similarCount = resolvedPackages.filter(p => p.matchType === 'similar').length;
+    const requestedDays = req.durationDays ? `${req.durationDays}-day` : null;
+
+    let matchIntro;
+    if (exactCount === 3) {
+      matchIntro = `Great news! I found 3 packages that exactly match your ${requestedDays || ''} requirement.`;
+    } else if (exactCount >= 1) {
+      matchIntro = `I found ${exactCount} exact match${exactCount > 1 ? 'es' : ''} for your ${requestedDays || ''} trip, plus ${3 - exactCount} very similar option${3 - exactCount > 1 ? 's' : ''}.`;
+    } else if (similarCount >= 2) {
+      matchIntro = `We don't have a package that's exactly ${requestedDays || 'that duration'} right now, but I have 3 very similar options — all within a day or two of what you're looking for.`;
+    } else {
+      matchIntro = `We don't have an exact match for your requirements right now, but here are our 3 best recommendations for ${req.destination || 'your destination'} that I think you'll love.`;
+    }
+
     const rankedList = resolvedPackages
-      .map(p => `Rank ${p.rank}: pkgId=${p.pkgId}  "${p.title}" — ${p.durationDays} days`)
+      .map(p => `${p.rank}. "${p.title}" — ${p.durationDays} days  [${p.matchType || 'recommendation'}]`)
       .join('\n');
 
     return {
@@ -1230,8 +1359,9 @@ class VapiController {
       enquirySaved:     true,
       packagesSelected: resolvedPackages.length,
       packages:         resolvedPackages,
+      matchIntro,
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `Enquiry saved. Ranked packages (1=best match):\n${rankedList}\n\nNow do the following in order:\n1. Present only the names and durations: "I have 3 great options for you — [name1] for [N] days, [name2] for [N] days, and [name3] for [N] days."\n2. Ask: "Would you like me to explain any of these in detail, or shall I send all the details to your phone?"\n3. If caller wants explanation → ask "Which one?" → wait for reply → call getPackageItinerary.\n4. If caller wants details sent → ${resolvedPackages.length > 0 ? `ask for their ${['agent_verified','existing_customer'].includes((callSession.get(_twilioCallSid) || {}).callerType) ? 'email or phone number for SMS' : 'phone number for SMS'}` : 'ask for their phone number for SMS'} → call sendPackageDetails.\nDo NOT call sendPackageDetails before the caller confirms they want to receive it.`,
+      message: `Enquiry saved. Present EXACTLY these 3 packages — do not substitute:\n\n${rankedList}\n\nSpeak this script word for word:\n1. "${matchIntro}"\n2. "First option: [name1], [N] days. Second option: [name2], [N] days. Third option: [name3], [N] days."\n3. ${exactCount === 0 ? '"If none of these feel quite right, I can also arrange a callback from one of our destination experts who can build a custom itinerary for you."\n4. ' : ''}"Would you like me to explain any of these packages in detail, or shall I send the full itinerary to your phone via SMS?"\n\nIf caller wants one explained → ask "Which one — first, second, or third?" → call getPackageItinerary with that package's pkgId.\nIf caller wants details sent → ask for their ${sendChannel} → call sendPackageDetails.\nIf caller wants a callback → call scheduleCallback.\nDo NOT call sendPackageDetails before the caller confirms.`,
     };
   }
 
