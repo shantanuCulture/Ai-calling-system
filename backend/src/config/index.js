@@ -33,6 +33,13 @@ const config = {
 
   // Portal URLs (used in link-sending tools)
   AGENT_REGISTRATION_URL: process.env.AGENT_REGISTRATION_URL || 'https://cultureholidays.com/agent-register',
+
+  // Human support ring — comma-separated E.164 numbers, all ring simultaneously
+  SUPPORT_NUMBERS: (process.env.SUPPORT_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean),
+
+  // Fallback phone used for Vapi dashboard/web test calls (no real inbound number).
+  // Set this to a verified agent's number so identity lookup works during testing.
+  TEST_CALLER_PHONE: process.env.TEST_CALLER_PHONE || null,
 };
 
 const required = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER', 'VAPI_API_KEY'];

@@ -8,24 +8,27 @@ class DbService {
   async getAgentByPhone(phone) {
     const pool = getPool();
     const r = await pool.request()
-      .input('phone', sql.VarChar(30), phone)
-      .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE Contact = @phone`);
+      .input('Action', sql.NVarChar(20),  'by_phone')
+      .input('Value',  sql.NVarChar(150), phone)
+      .execute('USP_LookupAgent_Ai_call_system');
     return r.recordset[0] || null;
   }
 
   async getAgentById(agentId) {
     const pool = getPool();
     const r = await pool.request()
-      .input('AgentId', sql.VarChar(50), agentId)
-      .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE AgentID = @AgentId`);
+      .input('Action', sql.NVarChar(20),  'by_id')
+      .input('Value',  sql.NVarChar(150), agentId)
+      .execute('USP_LookupAgent_Ai_call_system');
     return r.recordset[0] || null;
   }
 
   async getAgentByEmail(email) {
     const pool = getPool();
     const r = await pool.request()
-      .input('email', sql.VarChar(150), email)
-      .query(`SELECT TOP 1 EmailID, Contact, AgentID FROM tbl_agent WHERE EmailID = @email`);
+      .input('Action', sql.NVarChar(20),  'by_email')
+      .input('Value',  sql.NVarChar(150), email)
+      .execute('USP_LookupAgent_Ai_call_system');
     return r.recordset[0] || null;
   }
 
@@ -43,7 +46,7 @@ class DbService {
     const pool = getPool();
     const r = await pool.request()
       .input('agentid', sql.VarChar(150), agentId)
-      .execute('GetAllCountryList_Ai_call_system');
+      .execute('USP_GetAllCountryList_Ai_call_system');
     return r.recordset;
   }
 
@@ -91,7 +94,7 @@ class DbService {
       const pool = getPool();
       const r = await pool.request()
         .input('phone', sql.VarChar(20), phone)
-        .execute('sp_GetCallerByPhone_Ai_call_system');
+        .execute('USP_GetCallerByPhone_Ai_call_system');
       return r.recordset[0] || null;
     } catch (err) {
       logger.error('getCallerByPhone failed', { err: err.message });
@@ -110,7 +113,7 @@ class DbService {
         .input('customer_type', sql.VarChar(20),  customer_type || 'unknown')
         .input('is_verified',   sql.Bit,          is_verified  ?? 0)
         .input('verify_method', sql.VarChar(20),  verify_method || null)
-        .execute('sp_InsertCallerRegistry_Ai_call_system');
+        .execute('USP_InsertCallerRegistry_Ai_call_system');
       logger.info(`[DB] insertCallerRegistry  phone=${phone}  type=${customer_type || 'unknown'}  verified=${is_verified ?? 0}  agentId=${agent_id || '-'}`);
       return r.recordset[0];
     } catch (err) {
@@ -132,7 +135,7 @@ class DbService {
         .input('verify_method', sql.VarChar(20),  verify_method || null)
         .input('verified_at',   sql.DateTime,     verified_at   || null)
         .input('notes',         sql.VarChar(500), notes         || null)
-        .execute('sp_UpdateCallerRegistry_Ai_call_system');
+        .execute('USP_UpdateCallerRegistry_Ai_call_system');
       return r.recordset[0];
     } catch (err) {
       logger.error('updateCallerRegistry failed', { err: err.message });
@@ -151,7 +154,7 @@ class DbService {
         .input('called_phone',    sql.VarChar(20),  called_phone)
         .input('direction',       sql.VarChar(10),  direction    || 'inbound')
         .input('vapi_call_id',    sql.VarChar(100), vapi_call_id || null)
-        .execute('sp_InsertCallMaster_Ai_call_system');
+        .execute('USP_InsertCallMaster_Ai_call_system');
       const row = r.recordset[0];
       logger.info(`[DB] insertCallMaster → CallID=${row?.CallID}  sid=${twilio_call_sid}  phone=${caller_phone}`);
       return row; // { CallID }
@@ -177,7 +180,7 @@ class DbService {
         .input('is_resolved',     sql.Bit,           is_resolved     ?? null)
         .input('recording_sid',   sql.VarChar(50),   recording_sid   || null)
         .input('recording_url',   sql.VarChar(500),  recording_url   || null)
-        .execute('sp_UpdateCallMaster_Ai_call_system');
+        .execute('USP_UpdateCallMaster_Ai_call_system');
       const parts = [caller_status, agent_id ? `agentId=${agent_id}` : null, caller_name ? `name=${caller_name}` : null, call_status].filter(Boolean).join('  ');
       logger.info(`[DB] updateCallMaster  sid=${twilio_call_sid}  ${parts}`);
       return r.recordset[0];
@@ -195,7 +198,7 @@ class DbService {
         .input('twilio_call_sid', sql.VarChar(50),   twilio_call_sid)
         .input('topic_name',      sql.VarChar(50),   topic_name)
         .input('topic_entry',     sql.NVarChar(sql.MAX), entry)
-        .execute('sp_UpdateCallTopic_Ai_call_system');
+        .execute('USP_UpdateCallTopic_Ai_call_system');
       logger.info(`[DB] updateCallTopic  topic=${topic_name}  sid=${twilio_call_sid}`);
       return r.recordset[0];
     } catch (err) {
@@ -215,7 +218,7 @@ class DbService {
         .input('call_summary',    sql.NVarChar(sql.MAX), call_summary || null)
         .input('call_status',     sql.VarChar(20),   call_status    || null)
         .input('is_resolved',     sql.Bit,           is_resolved    ?? null)
-        .execute('sp_CloseCallMaster_Ai_call_system');
+        .execute('USP_CloseCallMaster_Ai_call_system');
       logger.info(`[DB] closeCallMaster  sid=${twilio_call_sid}  status=${call_status}  resolved=${is_resolved ?? 'null'}  summary="${(call_summary || '').substring(0, 80)}"`);
       return r.recordset[0];
     } catch (err) {
@@ -229,7 +232,7 @@ class DbService {
       const pool = getPool();
       const r = await pool.request()
         .input('twilio_call_sid', sql.VarChar(50), twilio_call_sid)
-        .execute('sp_GetCallByTwilioSID_Ai_call_system');
+        .execute('USP_GetCallByTwilioSID_Ai_call_system');
       return r.recordset[0] || null;
     } catch (err) {
       logger.error('getCallByTwilioSID failed', { err: err.message });
@@ -251,7 +254,7 @@ class DbService {
         .input('body',             sql.NVarChar(sql.MAX), body            || null)
         .input('twilio_msg_sid',   sql.VarChar(50),      twilio_msg_sid   || null)
         .input('status',           sql.VarChar(20),      status           || 'sent')
-        .execute('sp_InsertCommLog_Ai_call_system');
+        .execute('USP_InsertCommLog_Ai_call_system');
       const to = recipient_phone || recipient_email || '-';
       logger.info(`[DB] insertCommLog  channel=${channel}  to=${to}  callId=${call_id || 'null'}  sid=${twilio_msg_sid || '-'}`);
       return r.recordset[0];
@@ -267,12 +270,13 @@ class DbService {
     try {
       const pool = getPool();
       const r = await pool.request()
-        .input('phone',      sql.VarChar(20),   phone)
-        .input('call_id',    sql.BigInt,        call_id    || null)
-        .input('reason',     sql.NVarChar(500), reason     || null)
-        .input('department', sql.VarChar(20),   department || 'sales')
-        .input('priority',   sql.Int,           priority   || 1)
-        .execute('sp_InsertCallback_Ai_call_system');
+        .input('Action',     sql.NVarChar(20),  'insert')
+        .input('Phone',      sql.NVarChar(20),  phone)
+        .input('CallId',     sql.BigInt,        call_id    || null)
+        .input('Reason',     sql.NVarChar(500), reason     || null)
+        .input('Department', sql.NVarChar(20),  department || 'sales')
+        .input('Priority',   sql.Int,           priority   || 1)
+        .execute('USP_ManageCallback_Ai_call_system');
       logger.info(`[DB] scheduleCallback  phone=${phone}  dept=${department || 'sales'}  callId=${call_id || 'null'}  reason="${(reason || '').substring(0, 60)}"`);
       return r.recordset[0];
     } catch (err) {
@@ -283,7 +287,9 @@ class DbService {
 
   async getPendingCallbacks() {
     const pool = getPool();
-    const r = await pool.request().execute('sp_GetPendingCallbacks_Ai_call_system');
+    const r = await pool.request()
+      .input('Action', sql.NVarChar(20), 'get_pending')
+      .execute('USP_ManageCallback_Ai_call_system');
     return r.recordset;
   }
 
@@ -291,12 +297,57 @@ class DbService {
     try {
       const pool = getPool();
       await pool.request()
-        .input('queue_id', sql.BigInt,     queue_id)
-        .input('status',   sql.VarChar(20), status)
-        .input('notes',    sql.NVarChar(300), notes || null)
-        .execute('sp_UpdateCallbackStatus_Ai_call_system');
+        .input('Action',  sql.NVarChar(20),  'update_status')
+        .input('QueueId', sql.BigInt,        queue_id)
+        .input('Status',  sql.NVarChar(20),  status)
+        .input('Notes',   sql.NVarChar(300), notes || null)
+        .execute('USP_ManageCallback_Ai_call_system');
     } catch (err) {
       logger.error('updateCallbackStatus failed', { err: err.message });
+    }
+  }
+
+  // ── Booking detail lookups (Existing Booking + Payment flows) ─────────────
+  //
+  // getFullBookingDetails() fetches ALL data in ONE DB call — returns:
+  //   { summary, travellers, payments }
+  //
+  // The controller stores this in callSession so _getPaymentDetails and
+  // _getGuestDetails can serve from the in-memory cache without extra DB calls.
+
+  async getFullBookingDetails(bookingRef, agentId) {
+    try {
+      const pool = getPool();
+      const r = await pool.request()
+        .input('BookingRef', sql.NVarChar(50), bookingRef)
+        .input('AgentId',    sql.NVarChar(50), agentId || null)
+        .execute('USP_GetFullBookingDetails_Ai_call_system');
+      return {
+        summary:    r.recordsets[0]?.[0] || null,   // RS0 — 1-row booking summary
+        travellers: r.recordsets[1]      || [],      // RS1 — per-traveller rows
+        payments:   r.recordsets[2]      || [],      // RS2 — per-payment-transaction rows
+      };
+    } catch (err) {
+      logger.error('getFullBookingDetails failed', { err: err.message, bookingRef });
+      return { summary: null, travellers: [], payments: [] };
+    }
+  }
+
+  async saveAdjustmentRequest({ bookingRef, agentId, requestType, details, callId }) {
+    try {
+      const pool = getPool();
+      const r = await pool.request()
+        .input('BookingRef',   sql.VarChar(50),       bookingRef)
+        .input('AgentId',      sql.VarChar(50),       agentId    || null)
+        .input('RequestType',  sql.VarChar(50),       requestType)
+        .input('Details',      sql.NVarChar(sql.MAX), details    || null)
+        .input('CallId',       sql.BigInt,            callId     || null)
+        .execute('USP_SaveAdjustmentRequest_Ai_call_system');
+      logger.info(`[DB] saveAdjustmentRequest  ref=${bookingRef}  type=${requestType}  agentId=${agentId || '-'}`);
+      return r.recordset[0] || { saved: true };
+    } catch (err) {
+      logger.error('saveAdjustmentRequest failed', { err: err.message, bookingRef, requestType });
+      return null;
     }
   }
 }

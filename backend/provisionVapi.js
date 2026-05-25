@@ -131,7 +131,7 @@ function buildAssistantPayload(assistant, toolIds, transferDestinations = []) {
       })) }]
     : [];
 
-  return {
+  const payload = {
     name:         assistant.name,
     firstMessage: assistant.firstMessage,
     transcriber:  assistant.transcriber ?? ASSISTANT_DEFAULTS.transcriber,
@@ -149,6 +149,16 @@ function buildAssistantPayload(assistant, toolIds, transferDestinations = []) {
     endCallPhrases:        assistant.endCallPhrases        ?? ASSISTANT_DEFAULTS.endCallPhrases,
     responseDelaySeconds:  assistant.responseDelaySeconds  ?? ASSISTANT_DEFAULTS.responseDelaySeconds,
   };
+  // firstMessageMode: when set to 'assistant-speaks-first-with-model-generated-message'
+  // the model generates its first utterance (may include a tool call) and speaks it
+  // immediately — no user input required to trigger the first AI response.
+  // This eliminates the silence after firstMessage plays on call-start / squad transfer.
+  if (assistant.firstMessageMode) {
+    payload.firstMessageMode = assistant.firstMessageMode;
+    // Model-generated first message — static firstMessage is unused
+    delete payload.firstMessage;
+  }
+  return payload;
 }
 
 // ── Phase 1: Tools ────────────────────────────────────────────────────────────
@@ -323,24 +333,17 @@ const SQUAD_WIRING = [
     assistantName: 'Verification',
     destinations: [
       {
-        assistantName: 'Existing Booking',
-        message: '',
-        description: 'Transfer directly to Existing Booking after successful OTP verification when the caller originally asked about their existing bookings, trips, itinerary, or current booking status.',
-      },
-      {
+        // SECURITY RULE: OTP success ALWAYS goes to Receptionist, NEVER directly to Existing Booking.
+        // Verification only registers the calling number; it does NOT grant booking access on the same call.
+        // The caller must hang up and call back from their now-registered number to access bookings.
         assistantName: 'Receptionist',
         message: '',
-        description: 'Transfer back to Receptionist after successful OTP verification when the original intent was NOT about existing bookings (e.g., agent wanted general assistance or intent is unclear).',
-      },
-      {
-        assistantName: 'New Booking',
-        message: '',
-        description: 'Transfer when OTP verification fails after maximum attempts, or caller wants to proceed as a new customer without verifying.',
+        description: 'Transfer back to Receptionist after successful OTP verification, regardless of the original intent. The caller is now registered and can be routed correctly on this or a future call.',
       },
       {
         assistantName: 'Human Support Router',
         message: '',
-        description: "Transfer when the agent's ID or email cannot be found in the system.",
+        description: "Transfer when the agent's ID or email cannot be found in the system, or when OTP verification fails after maximum attempts.",
       },
     ],
   },
@@ -368,6 +371,11 @@ const SQUAD_WIRING = [
     assistantName: 'Existing Booking',
     destinations: [
       {
+        assistantName: 'Payment',
+        message: '',
+        description: 'Transfer when the caller raises ANY payment-related query: failed payment, outstanding balance, guest payment, refund request, payment link needed, or any payment discrepancy.',
+      },
+      {
         assistantName: 'Communication',
         message: '',
         description: 'Transfer when caller needs to receive an itinerary PDF, booking confirmation, or other booking documents via email or SMS.',
@@ -375,7 +383,7 @@ const SQUAD_WIRING = [
       {
         assistantName: 'Human Support Router',
         message: '',
-        description: 'Transfer for payment issues, visa queries, hotel change requests, or any booking issue that cannot be resolved directly.',
+        description: 'Transfer when caller is unverified, or for visa queries, complex hotel changes, or any issue that cannot be resolved after 2 attempts.',
       },
     ],
   },
@@ -393,6 +401,21 @@ const SQUAD_WIRING = [
     // Terminal node — no outbound transfers
     assistantName: 'Human Support Router',
     destinations: [],
+  },
+  {
+    assistantName: 'Payment',
+    destinations: [
+      {
+        assistantName: 'Existing Booking',
+        message: '',
+        description: 'Transfer back to Existing Booking when the caller wants to discuss non-payment booking issues such as itinerary changes, date changes, or general booking queries after payment issue is resolved.',
+      },
+      {
+        assistantName: 'Human Support Router',
+        message: '',
+        description: 'Transfer when caller insists on speaking to a human agent immediately after their payment issue has been logged.',
+      },
+    ],
   },
 ];
 
@@ -451,36 +474,57 @@ function printFinalSummary(assistantResults, squadId) {
   log('=================================================================');
 }
 
-// ── Phase 4: Create Squad ─────────────────────────────────────────────────────
+// ── Phase 4: Create or Update Squad ──────────────────────────────────────────
 
-async function createSquad(assistantResults) {
+// Canonical member order — Receptionist is always first (default entry point).
+// This list is the single source of truth for squad membership.
+// Add new assistants here whenever a new assistant is added to ASSISTANTS in vapi-config.js.
+const SQUAD_MEMBER_ORDER = [
+  'Receptionist',
+  'Verification',
+  'New Booking',
+  'Existing Booking',
+  'Communication',
+  'Human Support Router',
+  'Payment',
+];
+
+async function upsertSquad(existingSquadId, assistantResults) {
   log('');
-  log('=== PHASE 4: CREATE SQUAD ===');
+  log('=== PHASE 4: SQUAD UPSERT ===');
 
-  // Order matches SQUAD_WIRING — Receptionist is always first (default entry point)
-  const orderedNames = ['Receptionist', 'Verification', 'New Booking', 'Existing Booking', 'Communication', 'Human Support Router'];
-  const members = orderedNames.map(name => {
+  const members = SQUAD_MEMBER_ORDER.map(name => {
     const found = assistantResults.find(a => a.name === name);
-    if (!found) { warn(`Assistant "${name}" not found — skipping from squad`); return null; }
+    if (!found) { warn(`Assistant "${name}" not found in provisioned list — skipping from squad`); return null; }
     return { assistantId: found.id };
   }).filter(Boolean);
 
-  const payload = {
-    name: 'Culture Holidays AI',
-    members,
-  };
+  const payload = { name: 'Culture Holidays AI', members };
 
-  log(`Creating squad with ${members.length} members...`);
-  if (DRY_RUN) { dryLog('POST /squad', JSON.stringify(payload, null, 2)); return 'dry-run-squad-id'; }
+  if (DRY_RUN) {
+    dryLog(existingSquadId ? `PATCH /squad/${existingSquadId}` : 'POST /squad', JSON.stringify(payload, null, 2));
+    return existingSquadId || 'dry-run-squad-id';
+  }
 
   await sleep(CALL_DELAY_MS);
-  const res = await withRetry(async () => {
-    const r = await api.post('/squad', payload);
-    return r.data;
-  }, 'POST /squad');
 
-  log(`Squad created! ID: ${res.id}`);
-  return res.id;
+  if (existingSquadId) {
+    // Always PATCH so new assistants are added and old ones are removed
+    log(`PATCH squad (id: ${existingSquadId}) — ${members.length} members: ${SQUAD_MEMBER_ORDER.join(', ')}`);
+    await withRetry(async () => {
+      await api.patch(`/squad/${existingSquadId}`, payload);
+    }, `PATCH /squad/${existingSquadId}`);
+    log(`Squad updated.`);
+    return existingSquadId;
+  } else {
+    log(`Creating new squad with ${members.length} members...`);
+    const res = await withRetry(async () => {
+      const r = await api.post('/squad', payload);
+      return r.data;
+    }, 'POST /squad');
+    log(`Squad created! ID: ${res.id}`);
+    return res.id;
+  }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -500,10 +544,9 @@ async function main() {
     const toolNameToId     = await provisionTools();
     const assistantResults = await provisionAssistants(toolNameToId);
 
-    // Auto-create squad if no ID is set yet
-    if (!squadId) {
-      squadId = await createSquad(assistantResults);
-    }
+    // Always upsert the squad — creates it if VAPI_SQUAD_ID is not set,
+    // or PATCHes the existing squad to ensure all members are current.
+    squadId = await upsertSquad(squadId, assistantResults);
 
     provisionSquad(squadId, assistantResults);
     printFinalSummary(assistantResults, squadId);

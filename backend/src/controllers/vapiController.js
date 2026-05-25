@@ -28,6 +28,49 @@ async function getCachedCountries() {
   return _countryCache;
 }
 
+// ── TourDate formatter ────────────────────────────────────────────────────────
+// Converts any TourDate from the DB into "25th May 2026" before sending to Vapi.
+// This lets the AI match the caller's spoken date directly against a readable
+// string instead of trying to decode ISO timestamps.
+const _MONTH_NAMES = [
+  'January','February','March','April','May','June',
+  'July','August','September','October','November','December',
+];
+
+function _ordinalSuffix(d) {
+  if (d >= 11 && d <= 13) return 'th';
+  switch (d % 10) {
+    case 1: return 'st';
+    case 2: return 'nd';
+    case 3: return 'rd';
+    default: return 'th';
+  }
+}
+
+function formatTourDate(raw) {
+  if (!raw) return raw;
+  let year, month, day;
+  const s = String(raw);
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    // ISO: "2026-05-25T..." or "2026-05-25"
+    year  = parseInt(s.substring(0, 4), 10);
+    month = parseInt(s.substring(5, 7), 10);
+    day   = parseInt(s.substring(8, 10), 10);
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)) {
+    // DD/MM/YYYY
+    const p = s.split('/');
+    day = parseInt(p[0], 10); month = parseInt(p[1], 10); year = parseInt(p[2], 10);
+  } else {
+    return raw; // unknown format — return as-is
+  }
+
+  if (!day || !month || !year || month < 1 || month > 12) return raw;
+  return `${day}${_ordinalSuffix(day)} ${_MONTH_NAMES[month - 1]} ${year}`;
+}
+// e.g. "2026-05-25T00:00:00.000Z" → "25th May 2026"
+//      "11/09/2026"               → "11th September 2026"
+
 // Levenshtein edit distance — handles phonetic/spelling variations from STT.
 function levenshtein(a, b) {
   const m = a.length, n = b.length;
@@ -57,6 +100,11 @@ const COUNTRY_MATCH_STOPWORDS = new Set([
   'very', 'each', 'much', 'over', 'same', 'take', 'name', 'most', 'many',
   'about', 'would', 'could', 'going', 'speak', 'visit', 'travel', 'holiday',
   'package', 'booking', 'enquiry', 'agent', 'human', 'support',
+  // Extra 4-char false-positive triggers
+  // "know" fuzzy-matches "new" in "New Zealand" (Levenshtein=2) — explicit block
+  'know', 'show', 'tell', 'said', 'told', 'want', 'give', 'find', 'look',
+  'what', 'which', 'where', 'when', 'how', 'does', 'dont', 'isnt', 'cant',
+  'info', 'data', 'details', 'status', 'update', 'check', 'existing',
 ]);
 
 // Returns the country object with an extra _matchLevel field, or null.
@@ -88,9 +136,12 @@ function matchCountry(text, countries) {
   }
 
   // Pass 4: Levenshtein — catch phonetic/spelling variations ("Dobai"→"Dubai")
-  // Only run against single-word input or individual words to avoid false positives
-  // on full sentences.
+  // Guard: skip fuzzy matching entirely for inputs with > 3 significant words.
+  // Full sentences ("I want to know about my existing booking") produce too many
+  // non-stopword tokens which each get scored independently, causing accidental
+  // country matches on common 4-char words like "know" → "new" (dist=2).
   const inputWords = t.split(/\s+/).filter(w => w.length > 3 && !COUNTRY_MATCH_STOPWORDS.has(w));
+  if (inputWords.length > 3) return null;
   const candidates = inputWords.length > 0 ? inputWords : [t];
   const scored = countries.map(c => {
     const name = c.CountryName?.toLowerCase() || '';
@@ -105,6 +156,132 @@ function matchCountry(text, countries) {
   if (best.dist <= threshold) return { ...best.c, _matchLevel: 'fuzzy' };
 
   return null;
+}
+
+// ── Server-side bookingRef resolver ──────────────────────────────────────────
+// GPT-4o sometimes calls getBookingDetails({}) with no bookingRef even though
+// it has the full agentBookings list in context and verbally confirmed the
+// booking with the caller. We recover the QueryID server-side by scoring each
+// booking against the recent conversation text (title keywords + date mentions).
+function _resolveBookingRefFromConversation(agentBookings, conversationMessages, lastUserText) {
+  if (!agentBookings?.length) return null;
+
+  const msgs = Array.isArray(conversationMessages) ? conversationMessages : [];
+
+  // 1. Scan last 10 messages for an explicit CHOQ... QueryID in the transcript
+  const choqWindow = msgs.slice(-10);
+  for (const msg of [...choqWindow].reverse()) {
+    const text = (msg.content || msg.message || '').toUpperCase();
+    const m = text.match(/CHOQ\d{8,}/);
+    if (m) {
+      const hit = agentBookings.find(b => b.QueryID === m[0]);
+      if (hit) return hit.QueryID;
+    }
+  }
+
+  // 2. Score each booking against LAST 3 messages only.
+  //
+  // WHY 3, NOT 20:
+  // When the AI lists multiple dates for the same package ("You have 4 Dashing Dubai
+  // bookings: Sep 11, Nov 19, Apr 16, May 25"), ALL those months/days enter the
+  // scoring window. Every booking then scores identically on title + its own date,
+  // making the scorer return null (ambiguous). Using only the last 3 messages (the
+  // confirmation exchange: user picks date → AI confirms → user says yes) means
+  // only the SPECIFIC date the caller confirmed is in scope, giving one clear winner.
+  const recent = msgs.slice(-3);
+  const recentText = [
+    ...recent.map(m => m.content || m.message || ''),
+    lastUserText || '',
+  ].join(' ').toLowerCase();
+
+  // Spoken ordinal → day number
+  const ORDINALS = {
+    first:1, second:2, third:3, fourth:4, fifth:5, sixth:6,
+    seventh:7, eighth:8, ninth:9, tenth:10, eleventh:11, twelfth:12,
+    thirteenth:13, fourteenth:14, fifteenth:15, sixteenth:16,
+    seventeenth:17, eighteenth:18, nineteenth:19, twentieth:20,
+    'twenty-first':21,'twenty-second':22,'twenty-third':23,'twenty-fourth':24,
+    'twenty-fifth':25,'twenty-sixth':26,'twenty-seventh':27,
+    'twenty-eighth':28,'twenty-ninth':29, thirtieth:30,'thirty-first':31,
+  };
+
+  // Month name → month number
+  const MONTHS = {
+    jan:1, january:1, feb:2, february:2, mar:3, march:3,
+    apr:4, april:4, may:5, jun:6, june:6, jul:7, july:7,
+    aug:8, august:8, sep:9, sept:9, september:9,
+    oct:10, october:10, nov:11, november:11, dec:12, december:12,
+  };
+
+  const mentionedMonths = new Set();
+  for (const [word, num] of Object.entries(MONTHS)) {
+    if (recentText.includes(word)) mentionedMonths.add(num);
+  }
+
+  const mentionedYears = new Set(
+    (recentText.match(/\b(202\d)\b/g) || []).map(Number)
+  );
+
+  const mentionedDays = new Set();
+  for (const [word, num] of Object.entries(ORDINALS)) {
+    if (recentText.includes(word)) mentionedDays.add(num);
+  }
+  // Also catch bare numbers like "11" in "September 11"
+  for (const m of (recentText.match(/\b([0-9]{1,2})\b/g) || [])) {
+    const n = parseInt(m, 10);
+    if (n >= 1 && n <= 31) mentionedDays.add(n);
+  }
+
+  const scored = agentBookings.map(b => {
+    let score = 0;
+
+    // Normalize TourDate — after formatTourDate() it is "25th May 2026", but
+    // support ISO and DD/MM/YYYY as fallbacks for any un-formatted rows.
+    const td = b.TourDate || '';
+    let day, month, year;
+    const _MN = {january:1,february:2,march:3,april:4,may:5,june:6,
+                 july:7,august:8,september:9,october:10,november:11,december:12};
+    if (/^\d{1,2}(?:st|nd|rd|th)\s+\w+\s+\d{4}/i.test(td)) {
+      // "25th May 2026" — our formatted output
+      const hm = td.match(/^(\d{1,2})(?:st|nd|rd|th)\s+(\w+)\s+(\d{4})/i);
+      day   = parseInt(hm[1], 10);
+      month = _MN[hm[2].toLowerCase()] || NaN;
+      year  = parseInt(hm[3], 10);
+    } else if (/^\d{4}-\d{2}-\d{2}/.test(td)) {
+      // ISO: "2026-09-11T..."
+      year  = parseInt(td.substring(0, 4), 10);
+      month = parseInt(td.substring(5, 7), 10);
+      day   = parseInt(td.substring(8, 10), 10);
+    } else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(td)) {
+      // DD/MM/YYYY
+      const p = td.split('/');
+      day = parseInt(p[0], 10); month = parseInt(p[1], 10); year = parseInt(p[2], 10);
+    } else {
+      day = NaN; month = NaN; year = NaN;
+    }
+
+    // Title keyword match (+2 per word > 3 chars)
+    const titleWords = b.PKG_TITLE.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    for (const w of titleWords) {
+      if (recentText.includes(w)) score += 2;
+    }
+
+    // Date components — month is most reliable spoken signal
+    if (mentionedMonths.has(month)) score += 4;
+    if (mentionedYears.has(year))   score += 1;
+    if (mentionedDays.has(day))     score += 2;
+
+    return { queryId: b.QueryID, score };
+  }).sort((a, b) => b.score - a.score);
+
+  // Require a clear winner with a meaningful score gap
+  if (scored.length === 0) return null;
+  const best = scored[0];
+  const second = scored[1];
+  if (best.score < 4) return null;                         // not enough evidence
+  if (second && best.score <= second.score + 1) return null; // too ambiguous
+
+  return best.queryId;
 }
 
 // ── Server-side requirement extraction ────────────────────────────────────────
@@ -290,7 +467,8 @@ class VapiController {
     }
 
     if (type === 'call-start') {
-      const phone = message?.call?.customer?.number || null;
+      // For web/dashboard test calls customer.number is null — fall back to TEST_CALLER_PHONE
+      const phone = message?.call?.customer?.number || config.TEST_CALLER_PHONE || null;
       const normalizedPhone = normalizePhone(phone) || phone || 'unknown';
       logger.info('VAPI CALL STARTED', { twilioSid, vapiId, phone });
 
@@ -319,6 +497,21 @@ class VapiController {
         callLogger.start(twilioSid, { phone: normalizedPhone, direction: 'inbound', callId: record?.CallID || null });
         callLogger.callEvent(twilioSid, 'call_started', { phone: normalizedPhone, vapiId });
         logger.info('Call record created via Vapi event', { callId: record?.CallID, twilioSid });
+
+        // Pre-load caller identity non-blocking so identifyCaller tool responds
+        // instantly from cache (<5ms) instead of waiting for a DB round-trip (300-400ms).
+        if (normalizedPhone && normalizedPhone !== 'unknown') {
+          dbService.getCallerByPhone(normalizedPhone)
+            .then(caller => {
+              if (caller) {
+                callSession.merge(twilioSid, { _preloadedCaller: caller });
+                logger.info('Caller pre-loaded at call-start', {
+                  twilioSid, agentId: caller.AgentID, source: caller.Source,
+                });
+              }
+            })
+            .catch(() => {}); // non-fatal — identifyCaller will fall back to live DB call
+        }
       }
     }
 
@@ -342,7 +535,10 @@ class VapiController {
     // Vapi injects call identifiers — available on every tool call
     const twilioCallSid = message.call?.phoneCallProviderId || null;
     const vapiCallId    = message.call?.id                  || null;
-    const callerPhone   = normalizePhone(message.call?.customer?.number) || message.call?.customer?.number || null;
+    // For web/dashboard test calls customer.number is null — fall back to TEST_CALLER_PHONE
+    // so identity lookup works without a real inbound number.
+    const rawPhone    = message.call?.customer?.number || config.TEST_CALLER_PHONE || null;
+    const callerPhone = normalizePhone(rawPhone) || rawPhone || null;
 
     // For web/dashboard test calls there is no TwilioCallSID — fall back to
     // vapiCallId so the in-memory session still works end-to-end.
@@ -506,6 +702,10 @@ class VapiController {
       case 'sendPackageDetails':     return this._sendPackageDetails(params);
       case 'scheduleCallback':       return this._scheduleCallback(params);
       case 'transferToHuman':        return this._transferToHuman(params);
+      case 'getBookingDetails':      return this._getBookingDetails(params);
+      case 'getPaymentDetails':      return this._getPaymentDetails(params);
+      case 'getGuestDetails':        return this._getGuestDetails(params);
+      case 'saveAdjustmentRequest':  return this._saveAdjustmentRequest(params);
       case 'saveLead':               return this._saveLead(params);
       case 'saveBookingEnquiry':     return this._saveBookingEnquiry(params);
       case 'sendBookingLink':        return this._sendBookingLink(params);
@@ -526,16 +726,22 @@ class VapiController {
 
   _buildCtx(sessionKey) {
     // sessionKey may be twilioCallSid (real call) or vapiCallId (web/dashboard call)
-    const s = sessionKey ? callSession.get(sessionKey) : {};
+    const s = sessionKey ? (callSession.get(sessionKey) || {}) : {};
     return {
-      phone:       s.phone       || null,
-      name:        s.name        || null,
-      type:        s.callerType  || 'unknown',
-      agentId:     s.agentId     || null,
-      verified:    s.isVerified  || false,
-      destination: s.destination || null,
-      callId:      s.callId      || null,
-      totalCalls:  s.totalCalls  ?? 0,
+      phone:            s.phone            || null,
+      name:             s.name             || null,
+      type:             s.callerType       || 'unknown',
+      agentId:          s.agentId          || null,
+      verified:         s.isVerified       || false,
+      destination:      s.destination      || null,
+      callId:           s.callId           || null,
+      totalCalls:       s.totalCalls       ?? 0,
+      email:            s.email            || null,
+      activeBookingRef: s.activeBookingRef || null,
+      // Package ID of the active booking — use for getPackageItinerary after getBookingDetails
+      activePackgId:    s.activePackgId    || null,
+      // Constructed payment URL (travid-based) — set after getBookingDetails or getPaymentDetails
+      paymentUrl:       s.paymentUrl       || null,
     };
   }
 
@@ -553,15 +759,16 @@ class VapiController {
     if (agentId) {
       const agent = await dbService.getAgentById(agentId);
       if (agent) {
+        const agentFirstName = agent.name ? agent.name.trim().split(/\s+/)[0] : null;
         if (_twilioCallSid) {
-          callSession.merge(_twilioCallSid, { callerType: 'agent_verified', agentId: agent.AgentID, email: agent.EmailID, isVerified: true });
-          await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'agent_verified', agent_id: agent.AgentID, caller_email: agent.EmailID });
+          callSession.merge(_twilioCallSid, { callerType: 'agent_verified', agentId: agent.AgentID, name: agent.name || null, email: agent.EmailID, isVerified: true });
+          await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'agent_verified', agent_id: agent.AgentID, caller_name: agent.name || null, caller_email: agent.EmailID });
         }
         return {
           success: true, type: 'agent_verified',
-          agentId: agent.AgentID, email: agent.EmailID, phone: agent.Contact,
+          agentId: agent.AgentID, name: agent.name || null, email: agent.EmailID, phone: agent.Contact,
           _ctx: this._buildCtx(_twilioCallSid),
-          message: `I've confirmed your Agent ID ${agent.AgentID}. How can I assist you today?`,
+          message: `I've confirmed your Agent ID ${agent.AgentID}${agentFirstName ? ', ' + agentFirstName : ''}. How can I assist you today?`,
         };
       }
       return {
@@ -575,62 +782,123 @@ class VapiController {
       return { success: false, error: 'phone is required', _ctx: this._buildCtx(_twilioCallSid) };
     }
 
-    // --- Stage 1: caller_registry ---
-    const registry = await dbService.getCallerByPhone(lookupPhone);
+    // --- USP_GetCallerByPhone: three-stage SP lookup ---
+    //   Source='registry', IsVerified=1  → verified agent (returning caller)
+    //   Source='tbl_agent', IsVerified=1  → known agent from main system, first time on AI line
+    //                                       treat as verified but ask soft confirmation
+    //   Source='registry', new_customer  → non-agent customer (returning)
+    //   0 rows                           → unknown or unverified with no agent record
+    //                                       → DO NOT treat as new customer; route to human support
 
-    if (registry && registry.IsVerified && registry.CustomerType === 'agent') {
-      await dbService.updateCallerRegistry({ phone: lookupPhone });
-      if (_twilioCallSid) {
-        callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'agent_verified', agentId: registry.AgentID, name: registry.CallerName, email: registry.CallerEmail, isVerified: true, totalCalls: registry.TotalCalls || 0 });
-        await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'agent_verified', agent_id: registry.AgentID, caller_name: registry.CallerName, caller_email: registry.CallerEmail });
-      }
-      return {
-        success: true, type: 'agent_verified',
-        agentId: registry.AgentID, name: registry.CallerName, email: registry.CallerEmail, phone: lookupPhone,
-        totalCalls: registry.TotalCalls,
-        _ctx: this._buildCtx(_twilioCallSid),
-        message: `Welcome back${registry.CallerName ? ' ' + registry.CallerName : ''}! How can I assist you today?`,
-      };
+    // Use pre-loaded caller if available (cached non-blocking at call-start for instant response)
+    const existingSession = _twilioCallSid ? callSession.get(_twilioCallSid) : null;
+    let registry = existingSession?._preloadedCaller || null;
+    if (registry) {
+      // Consume the cache so we never serve a stale pre-load on a subsequent call
+      callSession.merge(_twilioCallSid, { _preloadedCaller: null });
+      logger.info('identifyCaller: served from pre-loaded cache', { twilioSid: _twilioCallSid, agentId: registry.AgentID });
+    } else {
+      registry = await dbService.getCallerByPhone(lookupPhone);
     }
 
-    if (registry && registry.CustomerType === 'new_customer') {
-      await dbService.updateCallerRegistry({ phone: lookupPhone });
-      if (_twilioCallSid) {
-        callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'new_customer', name: registry.CallerName, isVerified: false });
-        await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'new_customer', caller_name: registry.CallerName });
+    if (registry) {
+
+      // ── Path A: Verified agent (from registry or tbl_agent) ───────────────────
+      if (registry.IsVerified && registry.CustomerType === 'agent') {
+        const fromTblAgent = registry.Source === 'tbl_agent';
+
+        // Bump call count only for registry rows (tbl_agent rows have no registry record yet)
+        if (!fromTblAgent) {
+          await dbService.updateCallerRegistry({ phone: lookupPhone });
+        }
+
+        if (_twilioCallSid) {
+          callSession.merge(_twilioCallSid, {
+            phone: lookupPhone, callerType: 'agent_verified',
+            agentId:    registry.AgentID    || null,
+            name:       registry.CallerName || null,
+            email:      registry.CallerEmail || null,
+            isVerified: true,
+            totalCalls: registry.TotalCalls || 0,
+          });
+          await dbService.updateCallMaster({
+            twilio_call_sid: _twilioCallSid,
+            caller_status: 'agent_verified',
+            agent_id:     registry.AgentID    || null,
+            caller_name:  registry.CallerName  || null,
+            caller_email: registry.CallerEmail || null,
+          });
+        }
+
+        // tbl_agent match: ask a soft name confirmation before giving full access.
+        // The agent IS verified — we just want to make sure it's really them.
+        // Use the name column from tbl_agent if available.
+        if (fromTblAgent) {
+          const agentFirstName = registry.CallerName
+            ? registry.CallerName.trim().split(/\s+/)[0]
+            : null;
+          const confirmMsg = agentFirstName
+            ? `I found a registered agent account linked to your number — ${agentFirstName}. Could you confirm that's you, so I can pull up your details?`
+            : `I found a registered agent account for your number (Agent ID: ${registry.AgentID}). Could you confirm that's you, so I can pull up your details?`;
+          return {
+            success: true, type: 'agent_verified',
+            agentId: registry.AgentID,
+            name:    registry.CallerName || null,
+            email:   registry.CallerEmail,
+            phone:   lookupPhone,
+            source:  'tbl_agent',
+            requiresConfirmation: true,
+            _ctx: this._buildCtx(_twilioCallSid),
+            message: confirmMsg,
+          };
+        }
+
+        // Registry match: full welcome, no confirmation needed.
+        // Use first name only for a natural greeting ("Welcome back Ashish!")
+        const firstName = registry.CallerName
+          ? registry.CallerName.trim().split(/\s+/)[0]
+          : null;
+        return {
+          success: true, type: 'agent_verified',
+          agentId:    registry.AgentID,
+          name:       registry.CallerName,
+          email:      registry.CallerEmail,
+          phone:      lookupPhone,
+          totalCalls: registry.TotalCalls,
+          source:     'registry',
+          _ctx: this._buildCtx(_twilioCallSid),
+          message: `Welcome back${firstName ? ', ' + firstName : ''}! How can I assist you today?`,
+        };
       }
-      return {
-        success: true, type: 'new_customer', name: registry.CallerName,
-        _ctx: this._buildCtx(_twilioCallSid),
-        message: `Welcome back${registry.CallerName ? ' ' + registry.CallerName : ''}! How can I assist you today?`,
-      };
+
+      // ── Path B: Registered non-agent customer ────────────────────────────────
+      if (registry.CustomerType === 'new_customer') {
+        await dbService.updateCallerRegistry({ phone: lookupPhone });
+        if (_twilioCallSid) {
+          callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'new_customer', name: registry.CallerName, isVerified: false });
+          await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'new_customer', caller_name: registry.CallerName });
+        }
+        const custFirstName = registry.CallerName
+          ? registry.CallerName.trim().split(/\s+/)[0]
+          : null;
+        return {
+          success: true, type: 'new_customer', name: registry.CallerName,
+          _ctx: this._buildCtx(_twilioCallSid),
+          message: `Welcome back${custFirstName ? ', ' + custFirstName : ''}! How can I assist you today?`,
+        };
+      }
     }
 
-    // --- Stage 2: tbl_agent by phone (auto-register on match) ---
-    const agent = await dbService.getAgentByPhone(lookupPhone);
-    if (agent) {
-      await dbService.insertCallerRegistry({ phone: lookupPhone, agent_id: agent.AgentID, caller_email: agent.EmailID, customer_type: 'agent', is_verified: 1, verify_method: 'phone_match' });
-      if (_twilioCallSid) {
-        callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'agent_verified', agentId: agent.AgentID, email: agent.EmailID, isVerified: true });
-        await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'agent_verified', agent_id: agent.AgentID, caller_email: agent.EmailID });
-      }
-      return {
-        success: true, type: 'agent_verified',
-        agentId: agent.AgentID, email: agent.EmailID, phone: lookupPhone,
-        _ctx: this._buildCtx(_twilioCallSid),
-        message: `Welcome back! I've identified you as Agent ${agent.AgentID}. How can I assist you today?`,
-      };
-    }
-
-    // --- Stage 3: Unknown → new customer ---
+    // --- Unknown / unverified with no agent record → route to human support ---
+    // Do NOT treat as a new customer. We cannot identify this caller.
     if (_twilioCallSid) {
-      callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'new_customer', isVerified: false });
-      await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'new_customer' });
+      callSession.merge(_twilioCallSid, { phone: lookupPhone, callerType: 'unknown', isVerified: false });
+      await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, caller_status: 'unknown' });
     }
     return {
-      success: true, type: 'new_customer',
+      success: true, type: 'unknown',
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `Welcome to Culture Holidays! Could I get your name and email so I can assist you better?`,
+      message: `I'm unable to find a registered account for your number. Let me transfer you to our support team who can assist you directly.`,
     };
   }
 
@@ -859,21 +1127,43 @@ class VapiController {
   // ── Tool: getAgentBookings ────────────────────────────────────────────────
 
   async _getAgentBookings({ agentId, _twilioCallSid }) {
-    if (!agentId) return { success: false, error: 'agentId is required', _ctx: this._buildCtx(_twilioCallSid) };
+    const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const resolvedAgentId = agentId || session.agentId;
+    if (!resolvedAgentId) return { success: false, error: 'agentId is required', _ctx: this._buildCtx(_twilioCallSid) };
 
-    const bookings = await dbService.getAgentBookings(agentId);
-    if (bookings.length === 0) {
+    const rawBookings = await dbService.getAgentBookings(resolvedAgentId);
+    if (rawBookings.length === 0) {
       return { success: true, count: 0, bookings: [], _ctx: this._buildCtx(_twilioCallSid), message: 'You have no upcoming bookings at the moment.' };
     }
 
-    const summary = bookings.slice(0, 5)
-      .map((b, i) => `${i + 1}. ${b.PKG_TITLE} — Tour Date: ${b.TourDate} (Ref: ${b.QueryID})`)
-      .join('\n');
+    // Format TourDate to human-readable "25th May 2026" so the AI can directly
+    // match the caller's spoken date without needing ISO date conversion.
+    const bookings = rawBookings.map(b => ({
+      ...b,
+      TourDate: formatTourDate(b.TourDate),
+    }));
 
+    // Store formatted list in session so the resolver can score by name/date
+    if (_twilioCallSid) callSession.merge(_twilioCallSid, { agentBookings: bookings });
+
+    const BOOKING_INSTRUCTION = `\n\nIMPORTANT: TourDate is now human-readable (e.g. "25th May 2026"). Each booking has its QueryID. When the caller identifies their booking by name and date, find the matching entry in bookings[] and use its QueryID as bookingRef when calling getBookingDetails. NEVER ask the caller for the QueryID — it is internal only.`;
+
+    if (bookings.length <= 3) {
+      const summary = bookings
+        .map((b, i) => `${i + 1}. ${b.PKG_TITLE} — ${b.TourDate}`)
+        .join('\n');
+      return {
+        success: true, count: bookings.length, bookings,
+        _ctx: this._buildCtx(_twilioCallSid),
+        message: `You have ${bookings.length} upcoming booking(s):\n${summary}\n\nWhich booking would you like details on?${BOOKING_INSTRUCTION}`,
+      };
+    }
+
+    // >3 bookings — ask caller to narrow down
     return {
       success: true, count: bookings.length, bookings,
       _ctx: this._buildCtx(_twilioCallSid),
-      message: `You have ${bookings.length} upcoming booking(s):\n${summary}\n\nWhich booking would you like details on?`,
+      message: `You have ${bookings.length} upcoming bookings. Could you tell me the package name or approximate tour date so I can find it quickly?${BOOKING_INSTRUCTION}`,
     };
   }
 
@@ -1208,10 +1498,263 @@ class VapiController {
     if (_twilioCallSid) {
       await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, routed_to: `human_${department || 'sales'}`, routing_reason: reason || null });
     }
+
+    // For real Twilio phone calls: redirect the active call to the simultaneous-ring endpoint.
+    // Vapi's SIP leg gets replaced with a TwiML <Dial> that rings all SUPPORT_NUMBERS at once.
+    const session = _twilioCallSid ? callSession.get(_twilioCallSid) : {};
+    if (_twilioCallSid && !session.webCall) {
+      try {
+        const { getTwilioClient } = require('../integrations/twilio');
+        const client = getTwilioClient();
+        await client.calls(_twilioCallSid).update({
+          url:    `${config.BASE_URL}/api/twilio/human-support`,
+          method: 'POST',
+        });
+        logger.info(`[transferToHuman] Call redirected to /human-support`, { callSid: _twilioCallSid, department });
+      } catch (err) {
+        logger.warn(`[transferToHuman] Twilio redirect failed: ${err.message}`, { callSid: _twilioCallSid });
+      }
+    }
+
     return {
       success: true, transferring: true, department: department || 'sales',
       _ctx: this._buildCtx(_twilioCallSid),
       message: `Connecting you with our ${department || 'sales'} team now. Please hold.`,
+    };
+  }
+
+  // ── Tool: getBookingDetails ───────────────────────────────────────────────
+
+  async _getBookingDetails({ bookingRef, agentId, _twilioCallSid, _conversationMessages, _lastUserText }) {
+    const session         = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const resolvedAgentId = agentId || session.agentId;
+
+    // Server-side bookingRef resolution — GPT-4o frequently calls this with no
+    // bookingRef even after verbally confirming the booking with the caller.
+    // Recover QueryID by scoring session.agentBookings against recent conversation.
+    let resolvedRef = bookingRef;
+    if (!resolvedRef) {
+      resolvedRef = session.activeBookingRef || null;
+    }
+    if (!resolvedRef && session.agentBookings?.length > 0) {
+      resolvedRef = _resolveBookingRefFromConversation(
+        session.agentBookings, _conversationMessages, _lastUserText
+      );
+      if (resolvedRef) {
+        logger.info(`  getBookingDetails: server-resolved bookingRef=${resolvedRef} from conversation context`);
+      }
+    }
+
+    if (!resolvedRef) {
+      return {
+        success: false,
+        error: 'bookingRef is required — use the QueryID from the agentBookings list that matches what the caller described',
+        _ctx: this._buildCtx(_twilioCallSid),
+      };
+    }
+
+    // Fetch ALL booking data in ONE DB call — store everything in session so
+    // _getPaymentDetails and _getGuestDetails can serve from cache, no extra DB hits.
+    const data = await dbService.getFullBookingDetails(resolvedRef, resolvedAgentId);
+    if (!data.summary) {
+      return {
+        success: false, error: 'Booking not found', _ctx: this._buildCtx(_twilioCallSid),
+        message: `I couldn't find a booking with reference ${resolvedRef}. Could you double-check the details?`,
+      };
+    }
+
+    const s = data.summary;
+
+    // Construct payment URL BEFORE callSession.merge so the reference is valid
+    const bookingTravIds = (data.travellers || []).map(t => t.TRAV_ID).filter(Boolean);
+    const bookingPaymentUrl = bookingTravIds.length > 0
+      ? `https://cultureholidays.com/thankyou?travid=${bookingTravIds.join(',')}`
+      : (s.PaymentUrl || null);
+
+    if (_twilioCallSid) {
+      callSession.merge(_twilioCallSid, {
+        activeBookingRef:  resolvedRef,
+        activeBooking:     data.summary,
+        activeBookingData: data,                         // { summary, travellers, payments }
+        activePackgId:     data.summary.PackgID || null, // exposed in _ctx for getPackageItinerary
+        paymentUrl:        bookingPaymentUrl,            // constructed from TRAV_IDs, exposed in _ctx
+      });
+    }
+
+    const parts = [
+      s.BookingStatus   ? `Status: ${s.BookingStatus}`                                              : null,
+      s.PackageName     ? `Package: ${s.PackageName}`                                               : null,
+      s.Country         ? `Destination: ${s.Country}`                                               : null,
+      s.CheckinDate     ? `Check-in: ${s.CheckinDate}`                                              : null,
+      s.CheckoutDate    ? `Check-out: ${s.CheckoutDate}`                                            : null,
+      s.DaysUntilTour  != null ? `Days Until Tour: ${s.DaysUntilTour}`                             : null,
+      s.DurationDays    ? `Duration: ${s.DurationDays} days / ${s.DurationNights || '?'} nights`   : null,
+      s.NumGuests       ? `Guests: ${s.NumGuests}`                                                  : null,
+      s.TotalAmount     ? `Total Amount: USD ${s.TotalAmount}`                                      : null,
+      s.AmountPaid      ? `Amount Paid: USD ${s.AmountPaid}`                                        : null,
+      s.BalanceDue      ? `Balance Due: USD ${s.BalanceDue}`                                        : null,
+      s.LastPaymentDate ? `Payment Due By: ${s.LastPaymentDate}`                                    : null,
+      s.TripType        ? `Trip Type: ${s.TripType}`                                                : null,
+    ].filter(Boolean).join(', ');
+
+    return {
+      success: true, booking: s, _ctx: this._buildCtx(_twilioCallSid),
+      message: `Here are the details for booking ${resolvedRef}: ${parts}.`,
+    };
+  }
+
+  // ── Tool: getPaymentDetails ───────────────────────────────────────────────
+
+  async _getPaymentDetails({ bookingRef, agentId, _twilioCallSid }) {
+    const session         = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const resolvedRef     = bookingRef || session.activeBookingRef;
+    const resolvedAgentId = agentId    || session.agentId;
+    if (!resolvedRef) return { success: false, error: 'bookingRef is required', _ctx: this._buildCtx(_twilioCallSid) };
+
+    // ── Serve from in-memory cache if _getBookingDetails already ran ──────────
+    let data = (session.activeBookingData?.summary?.BookingRef === resolvedRef)
+      ? session.activeBookingData
+      : null;
+
+    if (!data) {
+      // Cache miss — fetch full data and store in session
+      data = await dbService.getFullBookingDetails(resolvedRef, resolvedAgentId);
+      if (_twilioCallSid && data.summary) {
+        const cacheTravIds = (data.travellers || []).map(t => t.TRAV_ID).filter(Boolean);
+        const cachePaymentUrl = cacheTravIds.length > 0
+          ? `https://cultureholidays.com/thankyou?travid=${cacheTravIds.join(',')}`
+          : (data.summary.PaymentUrl || null);
+        callSession.merge(_twilioCallSid, {
+          activeBookingRef:  resolvedRef,
+          activeBooking:     data.summary,
+          activeBookingData: data,
+          activePackgId:     data.summary.PackgID || null,
+          paymentUrl:        cachePaymentUrl,
+        });
+      }
+    }
+
+    if (!data.summary) {
+      return {
+        success: false, error: 'Payment details not found', _ctx: this._buildCtx(_twilioCallSid),
+        message: `I couldn't find payment details for booking ${resolvedRef}. Please check the reference number.`,
+      };
+    }
+
+    const s    = data.summary;
+    const txns = data.payments || [];
+
+    // Construct payment URL from traveller IDs (format: travid=id1,id2,id3)
+    const travIds = (data.travellers || []).map(t => t.TRAV_ID).filter(Boolean);
+    const paymentUrl = travIds.length > 0
+      ? `https://cultureholidays.com/thankyou?travid=${travIds.join(',')}`
+      : (s.PaymentUrl || null);
+
+    // Inject constructed paymentUrl into summary so Flow C finds it at payment.summary.PaymentUrl
+    const summaryWithUrl = { ...s, PaymentUrl: paymentUrl };
+
+    // Store in session so Communication assistant can read it from _ctx.paymentUrl
+    if (_twilioCallSid && paymentUrl) {
+      callSession.merge(_twilioCallSid, { paymentUrl });
+    }
+
+    // Transaction history for AI (exclude commission — not in txn rows anyway)
+    const txnLines = txns.map(t => {
+      const date = t.CreatedDate ? new Date(t.CreatedDate).toDateString() : 'unknown date';
+      const mode = t.PayMode || t.bank || 'N/A';
+      return `${t.TxnStatus} USD ${t.Amount} on ${date} via ${mode}`;
+    });
+
+    const payParts = [
+      s.TotalAmount      ? `Total: USD ${s.TotalAmount}`           : null,
+      s.AmountPaid       ? `Paid: USD ${s.AmountPaid}`             : null,
+      s.BalanceDue       ? `Balance Due: USD ${s.BalanceDue}`      : null,
+      s.LastPaymentDate  ? `Due By: ${s.LastPaymentDate}`          : null,
+      paymentUrl         ? `Payment link available`                : null,
+    ].filter(Boolean).join(', ');
+
+    return {
+      success: true,
+      payment: { summary: summaryWithUrl, transactions: txns },
+      _ctx: this._buildCtx(_twilioCallSid),
+      message: `Payment details for booking ${resolvedRef}: ${payParts || 'No payment data available'}.`
+        + (txnLines.length ? ` Transaction history: ${txnLines.join('; ')}.` : ''),
+    };
+  }
+
+  // ── Tool: getGuestDetails ─────────────────────────────────────────────────
+
+  async _getGuestDetails({ bookingRef, _twilioCallSid }) {
+    const session     = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const resolvedRef = bookingRef || session.activeBookingRef;
+    if (!resolvedRef) return { success: false, error: 'bookingRef is required', _ctx: this._buildCtx(_twilioCallSid) };
+
+    // ── Serve from in-memory cache if _getBookingDetails already ran ──────────
+    let data = (session.activeBookingData?.summary?.BookingRef === resolvedRef)
+      ? session.activeBookingData
+      : null;
+
+    if (!data) {
+      data = await dbService.getFullBookingDetails(resolvedRef, session.agentId);
+      if (_twilioCallSid && data.summary) {
+        callSession.merge(_twilioCallSid, {
+          activeBookingRef:  resolvedRef,
+          activeBooking:     data.summary,
+          activeBookingData: data,
+        });
+      }
+    }
+
+    const travellers = data?.travellers || [];
+    if (travellers.length === 0) {
+      return {
+        success: false, error: 'No guest details found', _ctx: this._buildCtx(_twilioCallSid),
+        message: `I couldn't find guest details for booking ${resolvedRef}.`,
+      };
+    }
+
+    const summary = travellers.map((g, i) => {
+      const due  = Number(g.TotalDueAmount  || 0).toFixed(0);
+      const paid = Number(g.PaxDepositAmount || 0).toFixed(0);
+      const total = Number(g.TotalPaxCost   || 0).toFixed(0);
+      const cancel = g.CancellationRequested ? ' [Cancellation Requested]' : '';
+      return `${i + 1}. ${g.FullName} (${g.TRAVELLER_TYPE || 'Adult'}): Total USD ${total}, Deposit Paid USD ${paid}, Due USD ${due}${cancel}`;
+    }).join('\n');
+
+    return {
+      success: true, guests: travellers, count: travellers.length,
+      _ctx: this._buildCtx(_twilioCallSid),
+      message: `Guest details for booking ${resolvedRef} — ${travellers.length} traveller(s):\n${summary}`,
+    };
+  }
+
+  // ── Tool: saveAdjustmentRequest ───────────────────────────────────────────
+
+  async _saveAdjustmentRequest({ bookingRef, agentId, requestType, details, _twilioCallSid }) {
+    if (!bookingRef)   return { success: false, error: 'bookingRef is required', _ctx: this._buildCtx(_twilioCallSid) };
+    if (!requestType)  return { success: false, error: 'requestType is required', _ctx: this._buildCtx(_twilioCallSid) };
+
+    const session         = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const resolvedAgentId = agentId || session.agentId;
+
+    await dbService.saveAdjustmentRequest({
+      bookingRef, requestType, details: details || '',
+      agentId: resolvedAgentId,
+      callId:  session.callId || null,
+    });
+
+    // Write to TopicsJSON so the request is auditable during the call
+    if (_twilioCallSid) {
+      topicBuffer.push(_twilioCallSid, 'support', {
+        ts: new Date().toISOString(), requestType, bookingRef,
+        details: details || '', saved: true,
+      });
+    }
+
+    return {
+      success: true, saved: true, requestType, bookingRef,
+      _ctx: this._buildCtx(_twilioCallSid),
+      message: `I've noted your ${requestType} request for booking ${bookingRef}. Our team will reach out to you for final verification and confirmation.`,
     };
   }
 

@@ -146,6 +146,49 @@ class TwilioController {
     res.type('text/xml').send(twiml);
   }
 
+  // ── POST /api/twilio/human-support ───────────────────────────────────────
+  // Called via Twilio REST API redirect from transferToHuman tool.
+  // Rings all SUPPORT_NUMBERS simultaneously — first to answer gets the call.
+
+  async handleHumanSupport(req, res) {
+    const { CallSid } = req.body;
+    const supportNumbers = config.SUPPORT_NUMBERS || [];
+
+    logger.info('HUMAN SUPPORT RING', { callSid: CallSid, numbersConfigured: supportNumbers.length });
+
+    if (supportNumbers.length === 0) {
+      logger.warn('SUPPORT_NUMBERS not configured — playing unavailable message');
+      const response = new VoiceResponse();
+      response.say({ voice: 'Polly.Joanna' }, 'We are sorry, all agents are currently unavailable. Please call back shortly and we will be happy to assist you.');
+      response.hangup();
+      return res.type('text/xml').send(response.toString());
+    }
+
+    if (CallSid) {
+      await dbService.updateCallMaster({
+        twilio_call_sid: CallSid,
+        call_status:     'in_progress',
+        routed_to:       'human_support',
+      }).catch(() => {});
+    }
+
+    const response = new VoiceResponse();
+    response.say({ voice: 'Polly.Joanna' }, 'Please hold while we connect you with our support team.');
+
+    const dial = response.dial({
+      callerId:       config.TWILIO_PHONE_NUMBER,
+      timeout:        30,
+      action:         `${config.BASE_URL}/api/twilio/transfer-fallback`,
+      answerOnBridge: true,
+    });
+
+    for (const number of supportNumbers) {
+      dial.number(number);
+    }
+
+    res.type('text/xml').send(response.toString());
+  }
+
   // ── POST /api/twilio/transfer-fallback ────────────────────────────────────
 
   async handleTransferFallback(req, res) {

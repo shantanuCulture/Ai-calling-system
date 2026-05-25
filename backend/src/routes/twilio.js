@@ -8,6 +8,9 @@ router.post('/incoming-call', ctrl.handleIncomingCall.bind(ctrl));
 // Human escalation: transfer active call to an agent
 router.post('/transfer-call', ctrl.handleTransferCall.bind(ctrl));
 
+// Simultaneous ring to all human support agents (redirected via Twilio REST API)
+router.post('/human-support', ctrl.handleHumanSupport.bind(ctrl));
+
 // Twilio action URL called when the agent dial attempt ends (no-answer, busy, etc.)
 router.post('/transfer-fallback', ctrl.handleTransferFallback.bind(ctrl));
 
