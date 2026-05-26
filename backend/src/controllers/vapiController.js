@@ -2031,27 +2031,40 @@ class VapiController {
   // ── Tool: sendPaymentLink ─────────────────────────────────────────────────
 
   async _sendPaymentLink({ phone, email, customerName, paymentUrl, amount, _twilioCallSid, _callerPhone }) {
-    if (!paymentUrl) return { success: false, error: 'paymentUrl is required', _ctx: this._buildCtx(_twilioCallSid) };
+    // Server-side fallbacks — model frequently omits all params even though they're in _ctx.
+    // The URL is constructed at getBookingDetails/getPaymentDetails time and stored in session.
+    const session        = _twilioCallSid ? callSession.get(_twilioCallSid) : {};
+    const resolvedUrl    = paymentUrl    || session.paymentUrl                || null;
+    const resolvedAmount = amount        || session.activeBooking?.BalanceDue || null;
+    const resolvedEmail  = email         || session.email                     || null;
+    const resolvedPhone  = phone         || _callerPhone                      || session.phone || null;
+    const resolvedName   = customerName  || session.name                      || null;
 
-    const session    = _twilioCallSid ? callSession.get(_twilioCallSid) : {};
-    const callId     = session.callId || null;
-    const smsPhone   = phone || _callerPhone;
-    const channels   = [], errors = [];
+    if (!resolvedUrl) {
+      return { success: false, error: 'paymentUrl is required — call getBookingDetails or getPaymentDetails first', _ctx: this._buildCtx(_twilioCallSid) };
+    }
 
-    if (email) {
+    const callId   = session.callId || null;
+    const channels = [], errors = [];
+
+    if (resolvedEmail) {
       try {
-        await emailService.sendPaymentLinkEmail({ to: email, customerName, paymentUrl, amount });
-        await dbService.insertCommunicationLog({ call_id: callId, channel: 'email', recipient_email: email, subject: 'Payment Link', body: paymentUrl, status: 'sent' });
+        await emailService.sendPaymentLinkEmail({ to: resolvedEmail, customerName: resolvedName, paymentUrl: resolvedUrl, amount: resolvedAmount });
+        await dbService.insertCommunicationLog({ call_id: callId, channel: 'email', recipient_email: resolvedEmail, subject: 'Payment Link', body: resolvedUrl, status: 'sent' });
         channels.push('email');
       } catch (err) { errors.push(`Email: ${err.message}`); }
     }
 
-    if (smsPhone) {
+    if (resolvedPhone) {
       try {
-        const msg = await smsService.sendPaymentLinkSMS({ to: smsPhone, customerName, paymentUrl, amount });
-        await dbService.insertCommunicationLog({ call_id: callId, channel: 'sms', recipient_phone: smsPhone, twilio_msg_sid: msg.sid, body: 'Payment link SMS', status: 'sent' });
+        const msg = await smsService.sendPaymentLinkSMS({ to: resolvedPhone, customerName: resolvedName, paymentUrl: resolvedUrl, amount: resolvedAmount });
+        await dbService.insertCommunicationLog({ call_id: callId, channel: 'sms', recipient_phone: resolvedPhone, twilio_msg_sid: msg.sid, body: 'Payment link SMS', status: 'sent' });
         channels.push('SMS');
       } catch (err) { errors.push(`SMS: ${err.message}`); }
+    }
+
+    if (channels.length === 0 && errors.length === 0) {
+      return { success: false, error: 'No email or phone available to send payment link. Ask the caller for their contact details.', _ctx: this._buildCtx(_twilioCallSid) };
     }
 
     const sent = channels.length > 0;
@@ -2059,7 +2072,7 @@ class VapiController {
       success: sent, channelsSent: channels,
       _ctx: this._buildCtx(_twilioCallSid),
       message: sent
-        ? `Payment link${amount ? ' for ' + amount : ''} sent to your ${channels.join(' and ')}. Please complete the payment at your earliest convenience.`
+        ? `Payment link${resolvedAmount ? ' for USD ' + resolvedAmount : ''} sent to your ${channels.join(' and ')}. Please complete the payment at your earliest convenience.`
         : `Unable to send the payment link. ${errors.join(' ')} Please try again.`,
     };
   }

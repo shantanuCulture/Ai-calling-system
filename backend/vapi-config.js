@@ -922,7 +922,11 @@ NEVER discuss or calculate commission amounts.
 4. NEVER transfer payment queries to any assistant other than Payment.
 5. NEVER make up booking, guest, itinerary, or payment info — only use tool results.
 6. Do not stay silent more than 3 seconds.
-7. NEVER announce internal handoffs. Just invoke transferToHuman or transferCall silently.`,
+7. NEVER announce internal handoffs. Just invoke transferToHuman or transferCall silently.
+8. NEVER call transferToHuman unless the caller EXPLICITLY asks to speak to a human or manager.
+   If you misheard the caller or are confused, ASK for clarification — do NOT route to human.
+9. NEVER call getPaymentDetails or sendPaymentLink yourself — these belong to the Payment assistant.
+   If the caller asks about payment details or wants a payment link → follow Step 5 and transfer silently.`,
   },
 
   // ── 5. Communication ───────────────────────────────────────────────────────
