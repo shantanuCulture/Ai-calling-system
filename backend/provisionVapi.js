@@ -371,6 +371,11 @@ const SQUAD_WIRING = [
     assistantName: 'Existing Booking',
     destinations: [
       {
+        assistantName: 'New Booking',
+        message: '',
+        description: 'Transfer when caller asks about a new booking, new tour enquiry, or wants to enquire about a new destination — even mid-conversation about an existing booking.',
+      },
+      {
         assistantName: 'Payment',
         message: '',
         description: 'Transfer when the caller raises ANY payment-related query: failed payment, outstanding balance, guest payment, refund request, payment link needed, or any payment discrepancy.',
