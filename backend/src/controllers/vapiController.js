@@ -163,7 +163,7 @@ function matchCountry(text, countries) {
 // it has the full agentBookings list in context and verbally confirmed the
 // booking with the caller. We recover the QueryID server-side by scoring each
 // booking against the recent conversation text (title keywords + date mentions).
-function _resolveBookingRefFromConversation(agentBookings, conversationMessages, lastUserText) {
+function _resolveBookingRefFromConversation(agentBookings, conversationMessages, lastUserText, lastAssistantText = '') {
   if (!agentBookings?.length) return null;
 
   const msgs = Array.isArray(conversationMessages) ? conversationMessages : [];
@@ -179,20 +179,53 @@ function _resolveBookingRefFromConversation(agentBookings, conversationMessages,
     }
   }
 
-  // 2. Score each booking against LAST 3 messages only.
+  // 2. Build scoring text.
   //
-  // WHY 3, NOT 20:
-  // When the AI lists multiple dates for the same package ("You have 4 Dashing Dubai
-  // bookings: Sep 11, Nov 19, Apr 16, May 25"), ALL those months/days enter the
-  // scoring window. Every booking then scores identically on title + its own date,
-  // making the scorer return null (ambiguous). Using only the last 3 messages (the
-  // confirmation exchange: user picks date → AI confirms → user says yes) means
-  // only the SPECIFIC date the caller confirmed is in scope, giving one clear winner.
-  const recent = msgs.slice(-3);
-  const recentText = [
-    ...recent.map(m => m.content || m.message || ''),
-    lastUserText || '',
-  ].join(' ').toLowerCase();
+  // Strategy: use the NARROWEST possible window so the "listing all dates" message
+  // (which pollutes the scoring with every month/day) stays out of scope.
+  //
+  // Case A — _lastUserText is a real date/package statement ("September 11 2026",
+  //          "Dashing Dubai May 25"): score from ONLY that text. This is the purest
+  //          signal — it's exactly what the caller said, uncontaminated by prior turns.
+  //
+  // Case B — _lastUserText is just an acknowledgment ("Yes", "Correct", "That's right"):
+  //          the caller confirmed the AI's rephrasing. Score from LAST 3 messages
+  //          (user picks date → AI confirms → user says yes). The AI confirmation
+  //          message contains the specific date, giving one clean winner.
+  //
+  // Case C — _lastUserText is empty: fall back to last 3 messages.
+
+  const ACKNOWLEDGMENTS = new Set([
+    'yes','yeah','yep','yup','sure','okay','ok','correct','right','exactly',
+    'that\'s right','that\'s correct','that is correct','affirmative','go ahead','proceed',
+  ]);
+  const lastTrimmed = (lastUserText || '').toLowerCase().trim();
+  // Strip trailing punctuation for matching
+  const lastCore = lastTrimmed.replace(/[.!?]+$/, '').trim();
+
+  let recentText;
+  if (lastCore.length >= 4 && !ACKNOWLEDGMENTS.has(lastCore)) {
+    // Case A: caller directly stated the date/package — score from their words alone.
+    // Most reliable signal — exactly what the caller said, no prior turn contamination.
+    recentText = lastTrimmed;
+  } else {
+    // Case B: caller said "yes" / "correct" — they confirmed what the AI just stated.
+    // The AI's confirmation utterance contains the booking date ("departing 11th September 2026").
+    // Use lastAssistantText (captured from conversation-update) as the scoring context —
+    // it's the AI's rephrasing and contains the exact date the caller confirmed.
+    //
+    // Case C: lastUserText is empty — fall back to last 3 messages from Vapi payload
+    // (only works for phone calls where Vapi includes message history).
+    if (lastAssistantText) {
+      recentText = lastAssistantText.toLowerCase();
+    } else {
+      const recent3 = msgs.slice(-3);
+      recentText = [
+        ...recent3.map(m => m.content || m.message || ''),
+        lastUserText || '',
+      ].join(' ').toLowerCase();
+    }
+  }
 
   // Spoken ordinal → day number
   const ORDINALS = {
@@ -391,6 +424,17 @@ class VapiController {
           .map(t => t.message || t.content || '')
           .slice(-3);
 
+        // Always capture last assistant utterance — used as scoring context when
+        // the caller says "yes" (acknowledgment) and _conversationMessages is empty.
+        const assistantTexts = turns
+          .filter(t => t.role === 'assistant')
+          .map(t => t.message || t.content || '')
+          .filter(Boolean);
+        if (assistantTexts.length > 0) {
+          const lastAssistant = assistantTexts[assistantTexts.length - 1];
+          if (lastAssistant) callSession.merge(sessionKey, { lastAssistantText: lastAssistant });
+        }
+
         if (userTexts.length > 0) {
           // Always keep the most recent user utterance — used for package reference resolution
           const lastText = userTexts[userTexts.length - 1];
@@ -453,14 +497,16 @@ class VapiController {
 
       // Flush per-call JSON log. Vapi doesn't reliably send a call-start event,
       // so start the logger here if it wasn't already started by another path.
-      if (twilioSid) {
-        if (!callLogger.has(twilioSid)) {
-          const s = callSession.get(twilioSid) || {};
-          callLogger.start(twilioSid, { phone: s.phone || 'unknown', direction: 'inbound', callId: s.callId || null });
+      const eocKey = twilioSid || vapiId;
+      if (eocKey) {
+        if (!callLogger.has(eocKey)) {
+          const s = callSession.get(eocKey) || {};
+          const dir = twilioSid ? 'inbound' : 'web';
+          callLogger.start(eocKey, { phone: s.phone || 'unknown', direction: dir, callId: s.callId || null });
         }
-        callLogger.callEvent(twilioSid, 'vapi_end_of_call', { summary: summary?.substring(0, 200) || null, durationSeconds: duration });
-        await callLogger.flush(twilioSid, {
-          session: callSession.get(twilioSid),
+        callLogger.callEvent(eocKey, 'vapi_end_of_call', { summary: summary?.substring(0, 200) || null, durationSeconds: duration });
+        await callLogger.flush(eocKey, {
+          session: callSession.get(eocKey),
           summary: summary || null,
         });
       }
@@ -507,6 +553,33 @@ class VapiController {
                 callSession.merge(twilioSid, { _preloadedCaller: caller });
                 logger.info('Caller pre-loaded at call-start', {
                   twilioSid, agentId: caller.AgentID, source: caller.Source,
+                });
+              }
+            })
+            .catch(() => {}); // non-fatal — identifyCaller will fall back to live DB call
+        }
+      } else if (vapiId) {
+        // Web/dashboard test call — no Twilio SID, use vapiId as session key
+        callSession.merge(vapiId, {
+          phone:          normalizedPhone,
+          callerType:     'unknown',
+          isVerified:     false,
+          vapiCallId:     vapiId,
+          webCall:        true,   // prevents _transferToHuman from trying Twilio redirect
+          _dbInitialized: true,
+        });
+        callLogger.start(vapiId, { phone: normalizedPhone, direction: 'web', callId: null });
+        callLogger.callEvent(vapiId, 'call_started', { phone: normalizedPhone, vapiId });
+        logger.info('Web call session created at call-start', { vapiId, phone: normalizedPhone });
+
+        // Pre-load caller identity non-blocking (uses TEST_CALLER_PHONE if set)
+        if (normalizedPhone && normalizedPhone !== 'unknown') {
+          dbService.getCallerByPhone(normalizedPhone)
+            .then(caller => {
+              if (caller) {
+                callSession.merge(vapiId, { _preloadedCaller: caller });
+                logger.info('Caller pre-loaded at call-start (web)', {
+                  vapiId, agentId: caller.AgentID, source: caller.Source,
                 });
               }
             })
@@ -742,6 +815,8 @@ class VapiController {
       activePackgId:    s.activePackgId    || null,
       // Constructed payment URL (travid-based) — set after getBookingDetails or getPaymentDetails
       paymentUrl:       s.paymentUrl       || null,
+      // Balance due on active booking — used by Communication / Payment for payment link amount
+      balanceDue:       s.activeBooking?.BalanceDue || null,
     };
   }
 
@@ -1537,11 +1612,20 @@ class VapiController {
       resolvedRef = session.activeBookingRef || null;
     }
     if (!resolvedRef && session.agentBookings?.length > 0) {
+      // _lastUserText comes from message.messages in the Vapi payload.
+      // For web/dashboard calls Vapi may not include message.messages at all,
+      // so fall back to session.lastUserText which is reliably captured from
+      // conversation-update events that fire on every turn.
+      const effectiveLastUserText  = _lastUserText || session.lastUserText || '';
+      const effectiveLastAssistant = session.lastAssistantText || '';
+      logger.info(`  getBookingDetails: resolving — lastUserText="${effectiveLastUserText.substring(0, 60)}"  lastAI="${effectiveLastAssistant.substring(0, 60)}"  bookings=${session.agentBookings.length}`);
       resolvedRef = _resolveBookingRefFromConversation(
-        session.agentBookings, _conversationMessages, _lastUserText
+        session.agentBookings, _conversationMessages, effectiveLastUserText, effectiveLastAssistant
       );
       if (resolvedRef) {
-        logger.info(`  getBookingDetails: server-resolved bookingRef=${resolvedRef} from conversation context`);
+        logger.info(`  getBookingDetails: server-resolved bookingRef=${resolvedRef}`);
+      } else {
+        logger.warn(`  getBookingDetails: resolver returned null — no clear winner  lastUserText="${effectiveLastUserText.substring(0, 80)}"`);
       }
     }
 
