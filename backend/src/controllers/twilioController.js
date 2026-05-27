@@ -1,15 +1,16 @@
 'use strict';
 
-const twilio        = require('twilio');
-const twilioService = require('../services/twilioService');
-const dbService     = require('../services/dbService');
-const callSession   = require('../utils/callSession');
-const callLogger    = require('../utils/callLogger');
-const { normalize } = require('../utils/phoneUtils');
-const otpStore      = require('../utils/otpStore');
-const topicBuffer   = require('../utils/topicBuffer');
-const config        = require('../config');
-const logger        = require('../utils/logger');
+const twilio           = require('twilio');
+const twilioService    = require('../services/twilioService');
+const dbService        = require('../services/dbService');
+const callSession      = require('../utils/callSession');
+const callLogger       = require('../utils/callLogger');
+const { normalize }    = require('../utils/phoneUtils');
+const otpStore         = require('../utils/otpStore');
+const topicBuffer      = require('../utils/topicBuffer');
+const config           = require('../config');
+const logger           = require('../utils/logger');
+const { getActiveAgents } = require('../utils/businessHours');
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -148,16 +149,28 @@ class TwilioController {
 
   // ── POST /api/twilio/human-support ───────────────────────────────────────
   // Called via Twilio REST API redirect from transferToHuman tool.
-  // Rings all SUPPORT_NUMBERS simultaneously — first to answer gets the call.
+  // Rings all active support agents from DB simultaneously (falls back to .env).
 
   async handleHumanSupport(req, res) {
     const { CallSid } = req.body;
-    const supportNumbers = config.SUPPORT_NUMBERS || [];
 
-    logger.info('HUMAN SUPPORT RING', { callSid: CallSid, numbersConfigured: supportNumbers.length });
+    // Load agents from DB — fall back to .env SUPPORT_NUMBERS if DB is empty
+    let supportNumbers = [];
+    try {
+      const dbAgents = await getActiveAgents('support');
+      supportNumbers = dbAgents.map(a => a.phone).filter(Boolean);
+      logger.info('HUMAN SUPPORT RING (DB agents)', { callSid: CallSid, count: supportNumbers.length });
+    } catch (err) {
+      logger.warn('Could not load support agents from DB — falling back to .env', { err: err.message });
+    }
 
     if (supportNumbers.length === 0) {
-      logger.warn('SUPPORT_NUMBERS not configured — playing unavailable message');
+      supportNumbers = config.SUPPORT_NUMBERS || [];
+      logger.info('HUMAN SUPPORT RING (.env fallback)', { callSid: CallSid, count: supportNumbers.length });
+    }
+
+    if (supportNumbers.length === 0) {
+      logger.warn('No support agents configured (DB or .env) — playing unavailable message');
       const response = new VoiceResponse();
       response.say({ voice: 'Polly.Joanna' }, 'We are sorry, all agents are currently unavailable. Please call back shortly and we will be happy to assist you.');
       response.hangup();
@@ -187,6 +200,91 @@ class TwilioController {
     }
 
     res.type('text/xml').send(response.toString());
+  }
+
+  // ── POST /api/twilio/connect-salesperson ─────────────────────────────────
+  // Called via Twilio REST API redirect from connectToSalesperson tool.
+  // Dials a specific salesperson number with 30-second timeout.
+  // On no-answer → /api/twilio/salesperson-fallback → routes back to Vapi.
+
+  async handleConnectSalesperson(req, res) {
+    const { CallSid } = req.body;
+    const session     = CallSid ? (callSession.get(CallSid) || {}) : {};
+
+    // Phone and name stored in session by _connectToSalesperson tool handler
+    const phone = session.pendingSalespersonPhone || null;
+    const name  = session.pendingSalespersonName  || 'your contact';
+
+    logger.info('CONNECT SALESPERSON', { callSid: CallSid, phone: phone || 'none', name });
+
+    if (!phone) {
+      logger.warn('handleConnectSalesperson: no pendingSalespersonPhone in session — falling back');
+      const response = new VoiceResponse();
+      response.say({ voice: 'Polly.Joanna' }, `We're sorry, we could not connect you at this time. Let us arrange a callback for you.`);
+      const vapiTwiml = twilioService.generateTwiMLForVapi();
+      // Re-enter Vapi with no-answer flag already set
+      if (CallSid) {
+        callSession.merge(CallSid, { salespersonCallResult: 'no_phone', salespersonCallAt: Date.now() });
+      }
+      return res.type('text/xml').send(vapiTwiml);
+    }
+
+    if (CallSid) {
+      await dbService.updateCallMaster({
+        twilio_call_sid: CallSid,
+        call_status:     'in_progress',
+        routed_to:       `salesperson_${name.replace(/\s+/g, '_').toLowerCase()}`,
+      }).catch(() => {});
+    }
+
+    const response = new VoiceResponse();
+    response.say({ voice: 'Polly.Joanna' }, `Please hold while we connect you to ${name}.`);
+
+    const dial = response.dial({
+      callerId:       config.TWILIO_PHONE_NUMBER,
+      timeout:        30,
+      action:         `${config.BASE_URL}/api/twilio/salesperson-fallback`,
+      answerOnBridge: true,
+    });
+    dial.number(phone);
+
+    res.type('text/xml').send(response.toString());
+  }
+
+  // ── POST /api/twilio/salesperson-fallback ─────────────────────────────────
+  // Called by Twilio when the salesperson dial times out / doesn't answer.
+  // Stores the no-answer result in session and returns the call to Vapi Squad.
+  // Receptionist picks up the call again with _ctx.salespersonCallResult = 'no_answer'.
+
+  async handleSalespersonFallback(req, res) {
+    const { DialCallStatus, CallSid } = req.body;
+    const session = CallSid ? (callSession.get(CallSid) || {}) : {};
+    const name    = session.pendingSalespersonName || 'the contact';
+
+    logger.warn('SALESPERSON FALLBACK', {
+      dialCallStatus: DialCallStatus,
+      callSid:        CallSid,
+      salesperson:    name,
+    });
+
+    // Mark no-answer in session so Receptionist can explain it when Vapi resumes
+    if (CallSid) {
+      callSession.merge(CallSid, {
+        salespersonCallResult:  'no_answer',
+        salespersonCallAt:      Date.now(),
+        // Keep pendingSalespersonName for _buildCtx to expose in _ctx
+      });
+      await dbService.updateCallMaster({
+        twilio_call_sid: CallSid,
+        routing_reason:  `Salesperson ${name} did not answer (DialCallStatus: ${DialCallStatus})`,
+      }).catch(() => {});
+    }
+
+    // Route the call back into Vapi Squad — session context is preserved.
+    // Receptionist will fire identifyCaller → agent_verified, then read
+    // _ctx.salespersonCallResult and offer a callback.
+    const twiml = twilioService.generateTwiMLForVapi();
+    res.type('text/xml').send(twiml);
   }
 
   // ── POST /api/twilio/transfer-fallback ────────────────────────────────────

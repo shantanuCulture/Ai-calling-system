@@ -350,6 +350,72 @@ class DbService {
       return null;
     }
   }
+
+  // ── Failed Payments ───────────────────────────────────────────────────────
+  // Returns recent failed payment transactions for a booking.
+  // SP is a dummy until user provides the real query.
+
+  async getFailedPayments({ agentId, status = null, fromDate = null }) {
+    try {
+      const pool = getPool();
+      const r = await pool.request()
+        .input('AgentId',   sql.NVarChar(100), agentId)
+        .input('Status',    sql.NVarChar(20),  status   || null)
+        .input('FromDate',  sql.Date,          fromDate || null)
+        .execute('USP_GetFailedPayments_Ai_call_system');
+      // RS0 = failed rows, RS1 = success rows (when @Status is NULL)
+      // When @Status = 'failed' → RS0 only; 'success' → RS0 only (still first recordset)
+      const failed  = r.recordsets[0] || [];
+      const success = r.recordsets[1] || [];
+      logger.info(`[DB] getFailedPayments  agentId=${agentId}  status=${status || 'both'}  failed=${failed.length}  success=${success.length}`);
+      return { failed, success };
+    } catch (err) {
+      logger.error('getFailedPayments failed', { err: err.message, agentId });
+      return { failed: [], success: [] };
+    }
+  }
+
+  // ── Salesperson routing ────────────────────────────────────────────────────
+  // Find the assigned salesperson for a CHAM message ID.
+  // @ChamId can be "33518", "CHAM33518", or "CHAM-33518" — SP strips prefix.
+  // Returns row with: MSG_ID, AssignStatus, AssignTo, StaffName, UserID, Mobile
+  // Returns null if ID is invalid or not yet assigned.
+
+  async findSalespersonByChamId(chamId) {
+    try {
+      const pool = getPool();
+      const r = await pool.request()
+        .input('ChamId', sql.NVarChar(50), chamId)
+        .execute('USP_FindSalespersonByQueryId_Ai_call_system');
+      logger.info(`[DB] findSalespersonByChamId  chamId=${chamId}  found=${r.recordset.length > 0}`);
+      return r.recordset[0] || null;
+    } catch (err) {
+      logger.error('findSalespersonByChamId failed', { err: err.message, chamId });
+      return null;
+    }
+  }
+
+  // ── Phone-based query lookup ───────────────────────────────────────────────
+  // Returns TOP 10 rows from TBL_MESSAGE matching the last 10 digits of @Mobile.
+  // If @AgentId is provided the result is further filtered by AGENT_ID.
+  // SP normalises both the input and the stored MOBILE column (strips +/-/space/etc.).
+  // Returns: MSG_ID, AGENT_ID, EMAIL_ID, Country, FromDate, CREATED_DATE,
+  //          SalespersonName, SalespersonId, SalespersonMobile
+
+  async getQueriesByPhone({ phone, agentId }) {
+    try {
+      const pool = getPool();
+      const r = await pool.request()
+        .input('Mobile',  sql.NVarChar(20), phone   || null)
+        .input('AgentId', sql.NVarChar(50), agentId || null)
+        .execute('USP_GetQueriesByPhone_Ai_call_system');
+      logger.info(`[DB] getQueriesByPhone  phone=${phone}  agentId=${agentId || 'null'}  found=${r.recordset.length}`);
+      return r.recordset || [];
+    } catch (err) {
+      logger.error('getQueriesByPhone failed', { err: err.message, phone, agentId });
+      return [];
+    }
+  }
 }
 
 module.exports = new DbService();

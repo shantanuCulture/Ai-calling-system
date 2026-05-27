@@ -23,4 +23,10 @@ router.post('/call-status', ctrl.handleCallStatus.bind(ctrl));
 // Recording ready callback (configure in Twilio Console → Recording Status Callback)
 router.post('/recording-status', ctrl.handleRecordingStatus.bind(ctrl));
 
+// Connect caller to a specific salesperson (triggered by connectToSalesperson tool)
+router.post('/connect-salesperson', ctrl.handleConnectSalesperson.bind(ctrl));
+
+// Fallback when salesperson doesn't answer — returns call to Vapi Squad
+router.post('/salesperson-fallback', ctrl.handleSalespersonFallback.bind(ctrl));
+
 module.exports = router;

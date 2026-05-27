@@ -11,6 +11,7 @@ const topicBuffer  = require('../utils/topicBuffer');
 const { normalize: normalizePhone } = require('../utils/phoneUtils');
 const logger             = require('../utils/logger');
 const resolvePackageRef  = require('../utils/resolvePackageRef');
+const businessHours      = require('../utils/businessHours');
 
 // ── Country list cache ────────────────────────────────────────────────────────
 // Loaded once from DB, refreshed every hour. Used to match destination names
@@ -786,6 +787,11 @@ class VapiController {
       case 'sendRegistrationLink':   return this._sendRegistrationLink(params);
       case 'sendVerificationOTP':    return this._sendVerificationOTP(params);
       case 'verifyOTP':              return this._verifyOTP(params);
+      // New feature tools
+      case 'getFailedPayments':      return this._getFailedPayments(params);
+      case 'getCallerQueries':       return this._getCallerQueries(params);
+      case 'findSalesperson':        return this._findSalesperson(params);
+      case 'connectToSalesperson':   return this._connectToSalesperson(params);
       // Backward-compat aliases
       case 'checkCallerIdentity':    return this._identifyCaller(params);
       case 'checkTourAvailability':  return this._getPackages(params);
@@ -817,6 +823,10 @@ class VapiController {
       paymentUrl:       s.paymentUrl       || null,
       // Balance due on active booking — used by Communication / Payment for payment link amount
       balanceDue:       s.activeBooking?.BalanceDue || null,
+      // Salesperson call result — set when /salesperson-fallback fires after no-answer
+      // Receptionist reads this to explain what happened and offer a callback.
+      salespersonCallResult: s.salespersonCallResult || null,   // 'no_answer' | 'no_phone' | null
+      pendingSalespersonName: s.pendingSalespersonName || null,  // name of salesperson we tried to reach
     };
   }
 
@@ -826,7 +836,32 @@ class VapiController {
   // 2. tbl_agent by phone (auto-registers if found)
   // 3. New customer fallback
 
-  async _identifyCaller({ phone, agentId, _twilioCallSid, _callerPhone }) {
+  async _identifyCaller({ phone, agentId, identityDenied, _twilioCallSid, _callerPhone }) {
+    // ── Identity denial path ─────────────────────────────────────────────────────
+    // Caller said "No, that's not me" after we proposed a name.
+    // Reset the session to 'unknown' so downstream routing (HSR) treats them correctly.
+    if (identityDenied) {
+      logger.info('[identifyCaller] Identity denied — resetting session to unknown', { sid: _twilioCallSid });
+      if (_twilioCallSid) {
+        callSession.merge(_twilioCallSid, {
+          callerType: 'unknown', isVerified: false,
+          agentId: null, name: null, email: null,
+        });
+        await dbService.updateCallMaster({
+          twilio_call_sid: _twilioCallSid,
+          caller_status: 'identity_denied',
+          agent_id: null,
+          caller_name: null,
+        }).catch(() => {});
+      }
+      return {
+        success:  true,
+        type:     'unknown',
+        _ctx:     this._buildCtx(_twilioCallSid),
+        message:  'Identity cleared. The caller is now treated as unverified.',
+      };
+    }
+
     const rawPhone    = phone || _callerPhone;
     const lookupPhone = normalizePhone(rawPhone) || rawPhone;
 
@@ -1570,6 +1605,25 @@ class VapiController {
   // ── Tool: transferToHuman ─────────────────────────────────────────────────
 
   async _transferToHuman({ reason, department, _twilioCallSid }) {
+    // ── Holiday / availability check ─────────────────────────────────────────
+    // Support is 24×7 so this only blocks on a public holiday.
+    // If unavailable: return an instructive message to the LLM — it should then
+    // speak the holiday message and call scheduleCallback instead of retrying.
+    // Check availability for the relevant team — sales has time-based hours; support is 24×7 (holidays only)
+    const teamToCheck  = (department === 'sales') ? 'sales' : 'support';
+    const availability = await businessHours.checkAvailability(teamToCheck);
+    if (!availability.available) {
+      logger.info(`[transferToHuman] ${teamToCheck} unavailable (${availability.reason}) — returning holiday message`);
+      return {
+        success:     false,
+        unavailable: true,
+        reason:      availability.reason,
+        holidayName: availability.holidayName || null,
+        _ctx:        this._buildCtx(_twilioCallSid),
+        message:     `${availability.message} Use scheduleCallback to arrange a callback for the caller instead of trying transferToHuman again.`,
+      };
+    }
+
     if (_twilioCallSid) {
       await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, routed_to: `human_${department || 'sales'}`, routing_reason: reason || null });
     }
@@ -1595,6 +1649,371 @@ class VapiController {
       success: true, transferring: true, department: department || 'sales',
       _ctx: this._buildCtx(_twilioCallSid),
       message: `Connecting you with our ${department || 'sales'} team now. Please hold.`,
+    };
+  }
+
+  // ── Tool: getFailedPayments ────────────────────────────────────────────────
+  // Returns recent failed + successful payment transactions for a verified agent.
+  // Uses agentId from session (no bookingRef needed — SP queries by agent).
+  // statusFilter: 'failed' | 'success' | null (both); fromDate: optional ISO date.
+
+  async _getFailedPayments({ statusFilter, fromDate, _twilioCallSid }) {
+    const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const agentId = session.agentId;
+
+    if (!agentId) {
+      return {
+        success: false,
+        error:   'Agent not verified — agentId not found in session. The caller must be verified before checking payment records.',
+        _ctx:    this._buildCtx(_twilioCallSid),
+      };
+    }
+
+    // Map statusFilter → SP @Status param ('failed' | 'success' | null)
+    let spStatus = null;
+    if (statusFilter === 'failed')  spStatus = 'failed';
+    if (statusFilter === 'success') spStatus = 'success';
+
+    const { failed, success } = await dbService.getFailedPayments({
+      agentId,
+      status:   spStatus,
+      fromDate: fromDate || null,
+    });
+
+    // ── Build spoken summary lines ─────────────────────────────────────────
+    const _fmtDate = raw => {
+      if (!raw) return null;
+      try {
+        return new Date(raw).toLocaleDateString('en-IN', {
+          day: 'numeric', month: 'short', year: 'numeric',
+        });
+      } catch { return null; }
+    };
+
+    const _fmtAmt = amt => amt ? `USD ${Number(amt).toLocaleString('en-US')}` : null;
+
+    const failedLines = failed.map((r, i) => {
+      const dateStr = _fmtDate(r.TransactionDate || r.CreatedDate);
+      const amtStr  = _fmtAmt(r.Amount);
+      const errText = r.ErrorText || r.ResponseMessage || r.Status || 'Unknown error';
+      const gw      = r.PaymentGateway ? ` via ${r.PaymentGateway}` : '';
+      const parts   = [`Attempt ${i + 1}`];
+      if (dateStr) parts.push(` on ${dateStr}`);
+      if (amtStr)  parts.push(` for ${amtStr}`);
+      parts.push(`${gw}: ${errText}.`);
+      return parts.join('');
+    });
+
+    const successLines = success.map((r, i) => {
+      const dateStr = _fmtDate(r.TransactionDate || r.CreatedDate);
+      const amtStr  = _fmtAmt(r.Amount);
+      const gw      = r.PaymentGateway ? ` via ${r.PaymentGateway}` : '';
+      const parts   = [`Payment ${i + 1}`];
+      if (amtStr)  parts.push(` of ${amtStr}`);
+      if (dateStr) parts.push(` on ${dateStr}`);
+      parts.push(`${gw}: Successful.`);
+      return parts.join('');
+    });
+
+    // ── Gateway-based suggestion ───────────────────────────────────────────
+    const failedGateways  = [...new Set(failed.map(r => r.PaymentGateway).filter(Boolean))];
+    const successGateways = [...new Set(success.map(r => r.PaymentGateway).filter(Boolean))];
+    let suggestion = '';
+    if (failed.length > 0) {
+      if (successGateways.length > 0) {
+        suggestion = ` Payments via ${successGateways[0]} have been going through — suggest using that gateway for the next attempt.`;
+      } else if (failedGateways.length > 0) {
+        suggestion = ` The failures are with ${failedGateways.join(' and ')}. Suggest switching to a different gateway or payment method.`;
+      } else {
+        suggestion = ' Suggest trying a different payment method or gateway.';
+      }
+    }
+
+    // ── Compose final message ──────────────────────────────────────────────
+    let message = '';
+    if (failed.length === 0 && success.length === 0) {
+      message = 'No payment records found for your account at the moment. If you are experiencing a payment issue with a very recent attempt, it may not have been recorded yet — please try again or use a different payment method.';
+    } else if (failed.length === 0) {
+      message = `No failed payment records found.${success.length > 0 ? ` Your ${success.length} recent payment(s) all appear successful.` : ''}`;
+    } else {
+      const parts = [];
+      if (failedLines.length > 0) {
+        parts.push(`I found ${failed.length} recent failed payment attempt(s):\n${failedLines.join('\n')}`);
+      }
+      if (successLines.length > 0 && spStatus !== 'failed') {
+        parts.push(`\n\nRecent successful payment(s) (${success.length}):\n${successLines.join('\n')}`);
+      }
+      message = parts.join('') + suggestion;
+    }
+
+    return {
+      success:      true,
+      failedCount:  failed.length,
+      successCount: success.length,
+      failed: failed.map(r => ({
+        date:      r.TransactionDate || r.CreatedDate,
+        amount:    r.Amount,
+        gateway:   r.PaymentGateway,
+        trackId:   r.TrackId,
+        bankTxnId: r.TId,
+        status:    r.Status,
+        error:     r.ErrorText || r.ResponseMessage,
+      })),
+      successful: success.map(r => ({
+        date:      r.TransactionDate || r.CreatedDate,
+        amount:    r.Amount,
+        gateway:   r.PaymentGateway,
+        trackId:   r.TrackId,
+        bankTxnId: r.TId,
+      })),
+      _ctx:    this._buildCtx(_twilioCallSid),
+      message,
+    };
+  }
+
+  // ── Tool: findSalesperson ─────────────────────────────────────────────────
+  // Looks up the assigned salesperson for a CHAM message ID only.
+  // Booking-based routing is handled by the Existing Booking assistant.
+  // Also checks sales team business hours availability.
+  // SP returns: MSG_ID, StaffName, Mobile, AssignStatus, AssignTo, UserID
+
+  // ── Tool: getCallerQueries ────────────────────────────────────────────────
+  // Fetches all TBL_MESSAGE queries for the caller's phone (+ agentId if verified).
+  // Used by Sales Connect as the FIRST action to avoid asking for CHAM ID upfront.
+  // Returns count, queries[], sameSalesperson flag, and a ready-made spoken message.
+
+  async _getCallerQueries({ _twilioCallSid, _callerPhone }) {
+    const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+    const agentId = session.agentId || null;
+    const phone   = _callerPhone || session.phone || null;
+    const _ctx    = this._buildCtx(_twilioCallSid);
+
+    if (!phone) {
+      return {
+        success: false,
+        error:   'Phone number not found in session',
+        count:   0,
+        queries: [],
+        _ctx,
+        message: "I wasn't able to look up your queries right now. Could you share your message ID so I can find your salesperson?",
+      };
+    }
+
+    const rows = await dbService.getQueriesByPhone({ phone, agentId });
+    const count = rows.length;
+
+    // ── Format each row ────────────────────────────────────────────────────
+    const queries = rows.map(row => {
+      let rawPhone = row.SalespersonMobile ? String(row.SalespersonMobile) : null;
+      if (rawPhone) {
+        rawPhone = normalizePhone(rawPhone);
+        if (rawPhone && /^\d{10}$/.test(rawPhone)) rawPhone = '+91' + rawPhone;
+      }
+      return {
+        chamId:          `CHAM-${row.MSG_ID}`,
+        msgId:           String(row.MSG_ID),
+        country:         row.Country       || null,
+        fromDate:        row.FromDate      || null,
+        createdDate:     row.CREATED_DATE  || null,
+        salespersonName: row.SalespersonName  || null,
+        salespersonId:   row.SalespersonId    || null,
+        salespersonPhone: rawPhone,
+      };
+    });
+
+    // ── Determine if all assigned queries share one salesperson ────────────
+    const spIds = [...new Set(queries.map(q => q.salespersonId).filter(Boolean))];
+    const sameSalesperson = count > 0 && spIds.length === 1;
+    const leadQuery       = sameSalesperson ? queries[0] : null;
+
+    // ── Build spoken message ───────────────────────────────────────────────
+    let message;
+    if (count === 0) {
+      message = "You don't have any active queries on record. If you'd still like to speak with our team, I can connect you with customer support.";
+    } else if (count === 1) {
+      const q    = queries[0];
+      const dest = q.country          || 'a destination';
+      const sp   = q.salespersonName  || 'a salesperson';
+      message = `I can see one query — ${dest}, handled by ${sp}. Shall I connect you with them?`;
+    } else if (sameSalesperson) {
+      const sp    = leadQuery.salespersonName || 'your contact';
+      const dests = [...new Set(queries.map(q => q.country).filter(Boolean))].join(', ');
+      message = `I can see ${count} queries, all handled by ${sp} — ${dests}. Shall I connect you with them?`;
+    } else if (count <= 5) {
+      const dests = [...new Set(queries.map(q => q.country).filter(Boolean))].join(', ');
+      message = `I can see ${count} queries — ${dests}. Which destination would you like to connect about?`;
+    } else {
+      message = `You have ${count} queries on record. Could you tell me your CHAM ID, destination, or tour date so I can find the right one for you?`;
+    }
+
+    logger.info('[getCallerQueries] resolved', {
+      sid: _twilioCallSid, phone, agentId, count, sameSalesperson,
+    });
+
+    return {
+      success:         true,
+      count,
+      queries,
+      sameSalesperson,
+      salespersonName:  sameSalesperson ? leadQuery.salespersonName  : null,
+      salespersonPhone: sameSalesperson ? leadQuery.salespersonPhone : null,
+      _ctx,
+      message,
+    };
+  }
+
+  // ── Tool: findSalesperson ─────────────────────────────────────────────────
+
+  async _findSalesperson({ chamId, _twilioCallSid }) {
+    // chamId is required
+    const raw = chamId ? chamId.trim() : null;
+
+    if (!raw) {
+      return {
+        success: false,
+        error:   'chamId is required — the caller must provide their CHAM message ID',
+        _ctx:    this._buildCtx(_twilioCallSid),
+        message: 'Could you please share your message ID? It starts with CHAM followed by some numbers — for example, CHAM-33518.',
+      };
+    }
+
+    // Build a display ID (always CHAM-XXXXX format)
+    const numericPart = raw.replace(/^cham-?/i, '').trim();
+    const displayId   = `CHAM-${numericPart}`;
+
+    const person = await dbService.findSalespersonByChamId(raw);
+
+    if (!person || !person.StaffName) {
+      return {
+        success:   true,
+        found:     false,
+        lookupId:  displayId,
+        _ctx:      this._buildCtx(_twilioCallSid),
+        message:   `I couldn't find anyone assigned to ${displayId}. This ID may be invalid or not yet assigned in our system. Could the caller please double-check their message ID?`,
+      };
+    }
+
+    // ── Check sales team availability ─────────────────────────────────────
+    const avail = await businessHours.checkAvailability('sales');
+
+    // Normalise phone to E.164 — tblstaff.Mobile stores 10-digit Indian numbers
+    let rawPhone = person.Mobile || null;
+    if (rawPhone) {
+      rawPhone = normalizePhone(rawPhone);               // handles 12-15 digit strings
+      if (rawPhone && /^\d{10}$/.test(rawPhone))
+        rawPhone = '+91' + rawPhone;                     // add +91 for bare 10-digit numbers
+    }
+    const phone = rawPhone;
+    const name  = person.StaffName || 'your contact';
+
+    if (!avail.available) {
+      return {
+        success:    true,
+        found:      true,
+        available:  false,
+        reason:     avail.reason,
+        name,
+        nextOpenAt: avail.nextOpenAt,
+        lookupId:   displayId,
+        _ctx:       this._buildCtx(_twilioCallSid),
+        message:    `I found ${name} as the person handling your query ${displayId}. However, ${avail.message}`,
+      };
+    }
+
+    if (!phone) {
+      return {
+        success:   true,
+        found:     true,
+        available: false,
+        reason:    'no_phone_configured',
+        name,
+        lookupId:  displayId,
+        _ctx:      this._buildCtx(_twilioCallSid),
+        message:   `I found ${name} for your query ${displayId} but their direct number isn't configured yet. I can arrange a callback instead — shall I do that?`,
+      };
+    }
+
+    return {
+      success:   true,
+      found:     true,
+      available: true,
+      name,
+      phone,
+      lookupId:  displayId,
+      _ctx:      this._buildCtx(_twilioCallSid),
+      message:   `I found ${name} as the person handling your query ${displayId}. They are currently available. Shall I connect you to them right now?`,
+    };
+  }
+
+  // ── Tool: connectToSalesperson ────────────────────────────────────────────
+  // Triggers a Twilio redirect to dial the salesperson directly.
+  // MUST only be called after the caller has confirmed they want to connect.
+  // On no-answer, /api/twilio/salesperson-fallback routes back to Vapi with
+  // salespersonCallResult='no_answer' in session.
+
+  async _connectToSalesperson({ phone, name, context, _twilioCallSid }) {
+    const session = _twilioCallSid ? (callSession.get(_twilioCallSid) || {}) : {};
+
+    if (!phone) {
+      return {
+        success: false,
+        error:   'phone is required',
+        _ctx:    this._buildCtx(_twilioCallSid),
+        message: 'I don\'t have a direct number for this contact. Let me arrange a callback instead.',
+      };
+    }
+
+    // Store in session so /connect-salesperson route can read it
+    if (_twilioCallSid) {
+      callSession.merge(_twilioCallSid, {
+        pendingSalespersonPhone:   phone,
+        pendingSalespersonName:    name  || 'your contact',
+        pendingSalespersonContext: context || null,
+        salespersonCallResult:     null,   // clear any previous result
+      });
+      await dbService.updateCallMaster({
+        twilio_call_sid: _twilioCallSid,
+        routing_reason:  `Connecting to salesperson ${name || 'unknown'} (${phone})`,
+      }).catch(() => {});
+    }
+
+    // For web/dashboard calls there is no Twilio SID to redirect
+    if (!_twilioCallSid || session.webCall) {
+      return {
+        success: false,
+        error:   'direct salesperson connection requires a live phone call',
+        _ctx:    this._buildCtx(_twilioCallSid),
+        message: 'I can arrange a callback from your contact for you. Shall I do that?',
+      };
+    }
+
+    // Redirect call to Twilio route that dials the salesperson
+    try {
+      const { getTwilioClient } = require('../integrations/twilio');
+      const client = getTwilioClient();
+      await client.calls(_twilioCallSid).update({
+        url:    `${config.BASE_URL}/api/twilio/connect-salesperson`,
+        method: 'POST',
+      });
+      logger.info(`[connectToSalesperson] Call redirected to /connect-salesperson`, {
+        callSid: _twilioCallSid, phone, name,
+      });
+    } catch (err) {
+      logger.warn(`[connectToSalesperson] Twilio redirect failed: ${err.message}`, { callSid: _twilioCallSid });
+      return {
+        success: false,
+        error:   'Failed to connect — please try again or arrange a callback',
+        _ctx:    this._buildCtx(_twilioCallSid),
+        message: `I wasn't able to connect you to ${name || 'your contact'} right now. Would you like me to arrange a callback instead?`,
+      };
+    }
+
+    return {
+      success:     true,
+      connecting:  true,
+      name:        name || 'your contact',
+      _ctx:        this._buildCtx(_twilioCallSid),
+      message:     `Connecting you to ${name || 'your contact'} now. Please hold.`,
     };
   }
 

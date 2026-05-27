@@ -318,6 +318,11 @@ const SQUAD_WIRING = [
         description: 'Transfer when a verified agent asks about their existing bookings, current trips, or specific booking details.',
       },
       {
+        assistantName: 'Sales Connect',
+        message: '',
+        description: 'Transfer when a verified agent wants to speak to their assigned salesperson or account manager, or mentions a query ID (CHAM-...) or wants to connect about a booking (CHOQ-...).',
+      },
+      {
         assistantName: 'Communication',
         message: '',
         description: 'Transfer when caller asks to receive package details, booking links, payment links, or any information via email or SMS.',
@@ -353,7 +358,12 @@ const SQUAD_WIRING = [
       {
         assistantName: 'Existing Booking',
         message: '',
-        description: 'Transfer when the caller is a verified agent and asks about their existing bookings or current trips.',
+        description: 'Transfer when the caller is a verified agent AND verbally confirms they want to switch to their existing bookings.',
+      },
+      {
+        assistantName: 'Sales Connect',
+        message: '',
+        description: 'Transfer when caller mentions a CHAM-... query ID or wants to speak to their salesperson about an enquiry.',
       },
       {
         assistantName: 'Communication',
@@ -374,6 +384,11 @@ const SQUAD_WIRING = [
         assistantName: 'New Booking',
         message: '',
         description: 'Transfer when caller asks about a new booking, new tour enquiry, or wants to enquire about a new destination — even mid-conversation about an existing booking.',
+      },
+      {
+        assistantName: 'Sales Connect',
+        message: '',
+        description: 'Transfer when caller wants to speak to their assigned salesperson or account manager, or mentions a CHAM-... or CHOQ-... reference and wants to connect with the person handling it.',
       },
       {
         assistantName: 'Payment',
@@ -419,6 +434,21 @@ const SQUAD_WIRING = [
         assistantName: 'Human Support Router',
         message: '',
         description: 'Transfer when caller insists on speaking to a human agent immediately after their payment issue has been logged.',
+      },
+    ],
+  },
+  {
+    assistantName: 'Sales Connect',
+    destinations: [
+      {
+        assistantName: 'Human Support Router',
+        message: '',
+        description: 'Transfer when the salesperson cannot be found, caller is unverified, or caller wants to speak to the general support team after salesperson is unavailable.',
+      },
+      {
+        assistantName: 'Existing Booking',
+        message: '',
+        description: 'Transfer when the caller also wants to discuss their existing booking details after the salesperson connection attempt.',
       },
     ],
   },
@@ -492,6 +522,7 @@ const SQUAD_MEMBER_ORDER = [
   'Communication',
   'Human Support Router',
   'Payment',
+  'Sales Connect',
 ];
 
 async function upsertSquad(existingSquadId, assistantResults) {
