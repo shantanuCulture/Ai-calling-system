@@ -52,8 +52,7 @@ class TwilioController {
     callLogger.start(CallSid, { phone, direction: 'inbound', callId: record?.CallID || null });
     callLogger.callEvent(CallSid, 'call_started', { phone, to: To, callId: record?.CallID || null });
 
-    const squadId = config.VAPI_ASSISTANT_ID;
-    logger.info(`Routing call → Vapi Squad via SIP`, { squadId, callSid: CallSid });
+    logger.info(`Routing call → Vapi via SIP`, { sipTarget: config.VAPI_PHONE_NUMBER_ID, callSid: CallSid });
 
     const twiml = twilioService.generateTwiMLForVapi();
     res.type('text/xml').send(twiml);
@@ -64,7 +63,15 @@ class TwilioController {
   async handleCallStatus(req, res) {
     const { CallSid, CallStatus, CallDuration, RecordingSid, RecordingUrl } = req.body;
 
-    logger.info('CALL STATUS', { callSid: CallSid, status: CallStatus, duration: CallDuration ? `${CallDuration}s` : '-' });
+    logger.info('CALL STATUS', {
+      callSid:      CallSid,
+      status:       CallStatus,
+      duration:     CallDuration ? `${CallDuration}s` : '-',
+      Direction:    req.body.Direction,
+      From:         req.body.From,
+      To:           req.body.To,
+      SequenceNumber: req.body.SequenceNumber,
+    });
 
     if (TERMINAL_STATUSES.has(CallStatus)) {
       const flushed = await topicBuffer.flush(CallSid);
@@ -121,6 +128,75 @@ class TwilioController {
     res.sendStatus(200);
   }
 
+  // ── POST /api/twilio/after-vapi ──────────────────────────────────────────
+  // Called by Twilio when the Vapi SIP <Dial> ends for ANY reason (normal end, endCall, etc.)
+  // instead of Twilio hanging up the parent PSTN call.
+  // If a pendingTransfer is stored in session → dial the support agent.
+  // Otherwise → play goodbye and hang up.
+
+  async handleAfterVapi(req, res) {
+    const { CallSid, DialCallStatus, DialCallSid } = req.body;
+
+    // pendingTransfer may be stored under the parent SID (CallSid) or the Vapi
+    // dial-leg SID (DialCallSid), depending on whether the call was routed via
+    // our server or Vapi's native Twilio integration. Check both.
+    const parentSession  = callSession.get(CallSid)    || {};
+    const dialSession    = DialCallSid ? (callSession.get(DialCallSid) || {}) : {};
+    const sessionWithPending = parentSession.pendingTransfer ? parentSession : dialSession;
+    const sidWithPending     = parentSession.pendingTransfer ? CallSid : DialCallSid;
+
+    logger.info(SEP);
+    logger.info('▶ AFTER VAPI — Vapi SIP ended', {
+      callSid:         CallSid,
+      dialCallSid:     DialCallSid,
+      dialCallStatus:  DialCallStatus,
+      pendingTransfer: sessionWithPending.pendingTransfer || null,
+      rawBody:         req.body,
+    });
+
+    const pending = sessionWithPending.pendingTransfer;
+    if (pending && pending.numbers && pending.numbers.length > 0) {
+      logger.info('AFTER VAPI: Pending transfer found — dialling support', {
+        callSid:    CallSid,
+        sidWithPending,
+        department: pending.department,
+        numbers:    pending.numbers,
+      });
+
+      // Clear the pending transfer so it isn't re-used on fallback
+      callSession.merge(sidWithPending, { pendingTransfer: null });
+
+      const fallbackUrl = `${config.BASE_URL}/api/twilio/transfer-fallback`;
+      const response    = new VoiceResponse();
+      const dial = response.dial({
+        callerId: config.TWILIO_PHONE_NUMBER,
+        timeout:  30,
+        action:   fallbackUrl,
+        method:   'POST',
+      });
+
+      for (const number of pending.numbers) {
+        const dialLegStatusUrl = `${config.BASE_URL}/api/twilio/dial-leg-status`;
+        dial.number({
+          statusCallbackEvent:   'initiated ringing answered completed',
+          statusCallback:        dialLegStatusUrl,
+          statusCallbackMethod:  'POST',
+        }, number);
+        logger.info('AFTER VAPI: Added <Number> to Dial', { callSid: CallSid, number });
+      }
+
+      const twiml = response.toString();
+      logger.info('AFTER VAPI: Returning Dial TwiML', { callSid: CallSid, twiml });
+      return res.type('text/xml').send(twiml);
+    }
+
+    // No pending transfer — call ended normally, hang up cleanly
+    logger.info('AFTER VAPI: No pending transfer — hanging up', { callSid: CallSid });
+    const response = new VoiceResponse();
+    response.hangup();
+    return res.type('text/xml').send(response.toString());
+  }
+
   // ── POST /api/twilio/transfer-call ────────────────────────────────────────
 
   async handleTransferCall(req, res) {
@@ -154,27 +230,50 @@ class TwilioController {
   async handleHumanSupport(req, res) {
     const { CallSid } = req.body;
 
+    logger.info(SEP);
+    logger.info('▶ HUMAN SUPPORT HANDLER — full Twilio request body', {
+      callSid:     CallSid,
+      CallStatus:  req.body.CallStatus,
+      From:        req.body.From,
+      To:          req.body.To,
+      Direction:   req.body.Direction,
+      rawBody:     req.body,
+    });
+
     // Load agents from DB — fall back to .env SUPPORT_NUMBERS if DB is empty
     let supportNumbers = [];
+    let agentSource = 'none';
     try {
       const dbAgents = await getActiveAgents('support');
       supportNumbers = dbAgents.map(a => a.phone).filter(Boolean);
-      logger.info('HUMAN SUPPORT RING (DB agents)', { callSid: CallSid, count: supportNumbers.length });
+      agentSource = 'db';
+      logger.info('HUMAN SUPPORT: DB agents loaded', {
+        callSid: CallSid,
+        count:   supportNumbers.length,
+        agents:  dbAgents.map(a => ({ name: a.name, phone: a.phone, priority: a.priority })),
+      });
     } catch (err) {
-      logger.warn('Could not load support agents from DB — falling back to .env', { err: err.message });
+      logger.warn('HUMAN SUPPORT: Could not load agents from DB — falling back to .env', { err: err.message });
     }
 
     if (supportNumbers.length === 0) {
       supportNumbers = config.SUPPORT_NUMBERS || [];
-      logger.info('HUMAN SUPPORT RING (.env fallback)', { callSid: CallSid, count: supportNumbers.length });
+      agentSource = 'env';
+      logger.info('HUMAN SUPPORT: Using .env fallback numbers', {
+        callSid:         CallSid,
+        count:           supportNumbers.length,
+        SUPPORT_NUMBERS: supportNumbers,
+      });
     }
 
     if (supportNumbers.length === 0) {
-      logger.warn('No support agents configured (DB or .env) — playing unavailable message');
+      logger.warn('HUMAN SUPPORT: No support agents configured anywhere — playing unavailable message', { callSid: CallSid });
       const response = new VoiceResponse();
       response.say({ voice: 'Polly.Joanna' }, 'We are sorry, all agents are currently unavailable. Please call back shortly and we will be happy to assist you.');
       response.hangup();
-      return res.type('text/xml').send(response.toString());
+      const twiml = response.toString();
+      logger.info('HUMAN SUPPORT: Returning unavailable TwiML', { callSid: CallSid, twiml });
+      return res.type('text/xml').send(twiml);
     }
 
     if (CallSid) {
@@ -185,21 +284,62 @@ class TwilioController {
       }).catch(() => {});
     }
 
-    const response = new VoiceResponse();
-    response.say({ voice: 'Polly.Joanna' }, 'Please hold while we connect you with our support team.');
-
-    const dial = response.dial({
-      callerId:       config.TWILIO_PHONE_NUMBER,
-      timeout:        30,
-      action:         `${config.BASE_URL}/api/twilio/transfer-fallback`,
-      answerOnBridge: true,
+    const fallbackUrl = `${config.BASE_URL}/api/twilio/transfer-fallback`;
+    logger.info('HUMAN SUPPORT: Building Dial TwiML', {
+      callSid:      CallSid,
+      callerId:     config.TWILIO_PHONE_NUMBER,
+      timeout:      30,
+      actionUrl:    fallbackUrl,
+      dialNumbers:  supportNumbers,
+      agentSource,
     });
 
+    const response = new VoiceResponse();
+
+    const dial = response.dial({
+      callerId: config.TWILIO_PHONE_NUMBER,
+      timeout:  30,
+      action:   fallbackUrl,
+      // answerOnBridge intentionally omitted (defaults false) — caller hears ringback tone while agent's phone rings.
+      // With answerOnBridge=true the caller hears dead silence until the agent picks up, which causes them to hang up.
+    });
+
+    const dialLegStatusUrl = `${config.BASE_URL}/api/twilio/dial-leg-status`;
     for (const number of supportNumbers) {
-      dial.number(number);
+      dial.number({
+        statusCallbackEvent: 'initiated ringing answered completed',
+        statusCallback:      dialLegStatusUrl,
+        statusCallbackMethod: 'POST',
+      }, number);
+      logger.info(`HUMAN SUPPORT: Added <Number> to Dial`, { callSid: CallSid, number, dialLegStatusUrl });
     }
 
-    res.type('text/xml').send(response.toString());
+    const twiml = response.toString();
+    logger.info('HUMAN SUPPORT: Returning TwiML to Twilio', { callSid: CallSid, twiml });
+    res.type('text/xml').send(twiml);
+  }
+
+  // ── POST /api/twilio/dial-leg-status ─────────────────────────────────────
+  // Per-leg status callback — fires for every state change on the outbound dial
+  // leg to +918292879966 (or any support number). Gives us initiated/ringing/answered/completed.
+
+  async handleDialLegStatus(req, res) {
+    const {
+      CallSid, CallStatus,
+      To, From,
+      CallDuration,
+    } = req.body;
+
+    logger.info('▶ DIAL LEG STATUS', {
+      to:          To,
+      from:        From,
+      callSid:     CallSid,
+      callStatus:  CallStatus,
+      duration:    CallDuration ? `${CallDuration}s` : 'N/A',
+      rawBody:     req.body,
+    });
+
+    res.sendStatus(200);
   }
 
   // ── POST /api/twilio/connect-salesperson ─────────────────────────────────
@@ -290,17 +430,49 @@ class TwilioController {
   // ── POST /api/twilio/transfer-fallback ────────────────────────────────────
 
   async handleTransferFallback(req, res) {
-    const { DialCallStatus, CallSid } = req.body;
-    logger.warn('TRANSFER FALLBACK (agent did not answer)', { dialCallStatus: DialCallStatus, callSid: CallSid });
+    const {
+      DialCallStatus, DialCallSid, DialCallDuration,
+      CallSid, CallStatus, DialBridged,
+      From, To,
+    } = req.body;
+
+    logger.warn(SEP);
+    logger.warn('▶ TRANSFER FALLBACK — full Twilio request body', {
+      callSid:          CallSid,
+      CallStatus,
+      DialCallStatus,
+      DialCallSid,
+      DialCallDuration: DialCallDuration ? `${DialCallDuration}s` : 'N/A',
+      DialBridged:      DialBridged ?? 'N/A',
+      From,
+      To,
+      rawBody:          req.body,
+    });
+
+    // Interpret the dial outcome
+    if (DialCallStatus === 'completed') {
+      logger.info('TRANSFER FALLBACK: Agent answered and call completed normally', { callSid: CallSid, DialCallSid, duration: DialCallDuration });
+    } else if (DialCallStatus === 'no-answer') {
+      logger.warn('TRANSFER FALLBACK: Agent did not answer within timeout (30s)', { callSid: CallSid });
+    } else if (DialCallStatus === 'busy') {
+      logger.warn('TRANSFER FALLBACK: Agent line was busy', { callSid: CallSid });
+    } else if (DialCallStatus === 'failed') {
+      logger.warn('TRANSFER FALLBACK: Dial to agent FAILED (bad number or carrier error)', { callSid: CallSid });
+    } else if (DialCallStatus === 'canceled') {
+      logger.warn('TRANSFER FALLBACK: Dial was canceled — caller likely hung up before agent answered', { callSid: CallSid });
+    } else {
+      logger.warn(`TRANSFER FALLBACK: Unexpected DialCallStatus = "${DialCallStatus}"`, { callSid: CallSid });
+    }
 
     if (CallSid) {
       await dbService.updateCallMaster({
         twilio_call_sid: CallSid,
-        routing_reason:  `Transfer fallback: agent dial status = ${DialCallStatus}`,
+        routing_reason:  `Transfer fallback: DialCallStatus=${DialCallStatus} DialCallSid=${DialCallSid || 'none'} duration=${DialCallDuration || 0}s`,
       });
     }
 
     const twiml = twilioService.generateTransferFallbackTwiML();
+    logger.warn('TRANSFER FALLBACK: Returning fallback TwiML', { callSid: CallSid, twiml });
     res.type('text/xml').send(twiml);
   }
 

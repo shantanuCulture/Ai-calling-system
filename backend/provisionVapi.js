@@ -142,7 +142,9 @@ function buildAssistantPayload(assistant, toolIds, transferDestinations = []) {
       toolIds,
       ...(inlineTools.length > 0 && { tools: inlineTools }),
     },
-    voice:                 ASSISTANT_DEFAULTS.voice,
+    // Per-assistant voice override: add a 'voice' key in vapi-config.js ASSISTANTS entry.
+    // Falls back to ASSISTANT_DEFAULTS.voice if not set.
+    voice: assistant.voice ? { ...ASSISTANT_DEFAULTS.voice, ...assistant.voice } : ASSISTANT_DEFAULTS.voice,
     maxDurationSeconds:    assistant.maxDurationSeconds    ?? ASSISTANT_DEFAULTS.maxDurationSeconds,
     silenceTimeoutSeconds: assistant.silenceTimeoutSeconds ?? ASSISTANT_DEFAULTS.silenceTimeoutSeconds,
     backgroundSound:       assistant.backgroundSound       ?? ASSISTANT_DEFAULTS.backgroundSound,

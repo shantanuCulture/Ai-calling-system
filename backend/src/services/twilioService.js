@@ -13,25 +13,32 @@ class TwilioService {
    * Vapi authenticates via the SIP username = your Vapi API key.
    */
   generateTwiMLForVapi(assistantId) {
-    const aid = assistantId || config.VAPI_ASSISTANT_ID;
+    // Use the Vapi phone number UUID as the SIP address — this routes to the
+    // squad configured on that number (same routing as api.vapi.ai/twilio/inbound_call).
+    // Using the squad ID directly in SIP fails: Vapi returns "phone number not found".
+    const sipTarget = config.VAPI_PHONE_NUMBER_ID || assistantId || config.VAPI_ASSISTANT_ID;
     const response = new VoiceResponse();
 
     const dial = response.dial({
-      callerId: config.TWILIO_PHONE_NUMBER,
-      timeout: 60,
+      callerId:   config.TWILIO_PHONE_NUMBER,
+      timeout:    60,
+      // When the Vapi SIP session ends for ANY reason, Twilio calls this URL instead of hanging up.
+      // This is how we bridge the caller to a human agent without a race condition.
+      action:     `${config.BASE_URL}/api/twilio/after-vapi`,
+      method:     'POST',
       // Trigger recording per-call — console setting alone is not enough
-      record: 'record-from-answer',
-      recordingStatusCallback: `${config.BASE_URL}/api/twilio/recording-status`,
+      record:     'record-from-answer',
+      recordingStatusCallback:       `${config.BASE_URL}/api/twilio/recording-status`,
       recordingStatusCallbackMethod: 'POST',
     });
 
     // Transport=tcp required for Vapi SIP
     dial.sip(
       { username: config.VAPI_API_KEY },
-      `sip:${aid}@sip.vapi.ai;transport=tcp`
+      `sip:${sipTarget}@sip.vapi.ai;transport=tcp`
     );
 
-    logger.info(`TwiML generated for Vapi assistant: ${aid}`);
+    logger.info(`TwiML generated for Vapi SIP target: ${sipTarget}`);
     return response.toString();
   }
 

@@ -33,4 +33,14 @@ const merge = (sid, patch) => sessions.set(sid, { ...get(sid), ...patch });
 const remove = (sid)       => sessions.delete(sid);
 const has   = (sid)        => sessions.has(sid);
 
-module.exports = { set, get, merge, remove, has };
+// Returns the SID of an existing session whose phone matches, or null.
+// Used to link the Vapi SIP dial-leg SID back to the parent PSTN session.
+const findSidByPhone = (phone) => {
+  if (!phone) return null;
+  for (const [sid, data] of sessions) {
+    if (data.phone === phone) return sid;
+  }
+  return null;
+};
+
+module.exports = { set, get, merge, remove, has, findSidByPhone };

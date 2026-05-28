@@ -12,6 +12,7 @@ const config = {
   // Vapi
   VAPI_API_KEY: process.env.VAPI_API_KEY,
   VAPI_ASSISTANT_ID: process.env.VAPI_ASSISTANT_ID,
+  VAPI_PHONE_NUMBER_ID: process.env.VAPI_PHONE_NUMBER_ID,
 
 
   // Public base URL for webhooks

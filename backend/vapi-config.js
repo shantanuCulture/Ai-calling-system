@@ -3,12 +3,12 @@
 /**
  * vapi-config.js — Single source of truth for the entire Vapi setup.
  *
- * TOOLS  — 24 tool definitions (schema + description).
- *          The provisioning script creates missing ones and updates
- *          the server URL on all existing ones.
+ * TOOLS      — Tool definitions (schema + description).
+ *              The provisioning script creates missing ones and updates
+ *              the server URL on all existing ones.
  *
- * ASSISTANTS — 7 assistant definitions (system prompt, first message,
- *              tool list by name, voice, limits).
+ * ASSISTANTS — Assistant definitions (system prompt, first message,
+ *              tool list by name, voice overrides, limits).
  *              The provisioning script resolves tool names → IDs at runtime.
  *
  * HOW TO USE
@@ -16,9 +16,68 @@
  *     node provisionVapi.js
  *   Environment variables required: VAPI_API_KEY, BASE_URL
  *
- * HOW TO DEPLOY TO A DIFFERENT ACCOUNT
- *   Set VAPI_API_KEY to the target account key and re-run.
- *   The script is fully idempotent (upsert by name).
+ * HOW TO DEPLOY TO A DIFFERENT VAPI ACCOUNT (staging → production)
+ *   1. Set VAPI_API_KEY in .env to the new account's key.
+ *   2. Set BASE_URL in .env to the production server URL.
+ *   3. Run: node provisionVapi.js
+ *   The script is fully idempotent — safe to re-run at any time.
+ *
+ * ── AUDIO STACK ───────────────────────────────────────────────────────────────
+ *
+ * TEXT-TO-SPEECH  (ElevenLabs via Vapi)
+ *   Provider : elevenlabs (Vapi alias: '11labs')
+ *   Voice    : Rachel  —  ID: EXAVITQu4vr4xnSDxMaL
+ *   Character: Warm, professional, calm female voice. Neutral accent.
+ *              Works well for both friendly (New Booking) and empathetic
+ *              (Human Support Router, Payment) contexts.
+ *   Settings:
+ *     stability        0.5   0 = very expressive / emotional
+ *                            1 = very consistent / monotone
+ *                            0.5 = natural balance — slight variation in tone
+ *     similarityBoost  0.75  How closely the output matches Rachel's original
+ *                            voice profile. 0.75 gives clear, natural output.
+ *     style            0     Style exaggeration (0–1). 0 = professional, no
+ *                            added flair. Increase to 0.2–0.3 for more warmth.
+ *     useSpeakerBoost  true  Post-processing to enhance clarity on phone audio.
+ *     speed            1.0   1.0 = normal pace. Lower = slower, higher = faster.
+ *                            0.9 recommended for Payment/Support (clearer figures).
+ *
+ *   To change the voice for production:
+ *     1. Browse voices at elevenlabs.io/voice-library.
+ *     2. Copy the Voice ID from the voice detail page.
+ *     3. Update voiceId in ASSISTANT_DEFAULTS.voice below.
+ *     4. Run: node provisionVapi.js
+ *
+ *   To use a DIFFERENT voice for a specific assistant:
+ *     Add a 'voice' field inside that assistant's entry in the ASSISTANTS array.
+ *     Example:  voice: { provider: '11labs', voiceId: '<OTHER_ID>', stability: 0.6 }
+ *     provisionVapi.js will use that voice instead of the default for that assistant.
+ *
+ * SPEECH-TO-TEXT  (Deepgram via Vapi)
+ *   Provider : deepgram
+ *   Model    : nova-3  — best accuracy for Indian English.
+ *                        nova-3 supports keyword boosting (nova-2 does not).
+ *   Language : en
+ *   Keywords : 'chagt:10'          — boosts recognition of agent ID prefix CHAGT
+ *              'cultureholidays:5' — ensures company name is always recognised
+ *              Format: 'word:boost_weight'  (nova-3 exclusive feature)
+ *
+ * LLM
+ *   Provider : openai
+ *   Model    : gpt-4o  — most capable + lowest latency for real-time tool calls.
+ *                        Downgrade to gpt-4o-mini only if cost is a concern —
+ *                        tool-call accuracy drops noticeably on complex flows.
+ *
+ * CALL AUDIO SETTINGS
+ *   backgroundSound       'office'  Subtle office ambience played under the AI
+ *                                   voice. Makes calls feel natural, not sterile.
+ *                                   Options: 'office', 'cafe', 'off'.
+ *   responseDelaySeconds  0.5       Brief pause before AI responds. Feels more
+ *                                   human — reduces the "instant robot" effect.
+ *   silenceTimeoutSeconds 20        Hangs up after 20 s of complete silence.
+ *   maxDurationSeconds    600       Hard cap of 10 minutes per call.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,15 +536,9 @@ const ASSISTANTS = [
     name: 'Receptionist',
     // Static firstMessage — plays the greeting instantly and 100% reliably.
     // The model's first turn is then solely to call identifyCaller and speak the result.
-    firstMessage: "Welcome to Culture Holidays! Please wait while we verify your identity.",
+    firstMessage: "Please hold.",
     tools: ['identifyCaller', 'updateCallTopic', 'scheduleCallback'],
-    systemPrompt: `⛔ ABSOLUTE RULE — FILLER PHRASES ARE STRICTLY FORBIDDEN:
-NEVER say "hold on", "hold on a sec", "one moment", "one sec", "just a sec", "bear with me",
-"let me check", or ANY other filler phrase at ANY point during the call.
-Speak ONLY the exact words prescribed in the flow below. No prefixes. No fillers. No improvisations.
-Violating this rule is a critical failure regardless of any other instruction.
-
-You are the receptionist at Culture Holidays, a premium international travel company.
+    systemPrompt: `You are the receptionist at Culture Holidays, a premium international travel company.
 Your ONLY job is to identify the caller and route them to the right team. Do NOT handle bookings, queries, or support yourself.
 
 ## HOW TO SPEAK
@@ -496,14 +549,11 @@ Your ONLY job is to identify the caller and route them to the right team. Do NOT
 
 ## STEP 1 — IDENTIFY (your FIRST action on every call, including squad transfers)
 
-The greeting has already played. Do NOT repeat it.
-Your VERY FIRST action — before saying a single word — is:
+Your VERY FIRST action is:
   → Call: identifyCaller({ phone: <caller's number> })
 
-⛔ SPEAK NOTHING before calling or while the tool runs.
-After the result arrives, your first spoken word MUST be "I" (as in "I found…" or "I wasn't able to…").
-Do NOT start with "Hold on", "One sec", "Just a sec", "Welcome", "Hello", or ANY other prefix.
-Your response MUST begin with the exact result text — zero words before it.
+While the tool is running you may say ONE brief placeholder — "Sure, just a moment." or "Please hold." — nothing else.
+After the result arrives, respond with the EXACT text prescribed below. No extra prefixes, no commentary, no repeated placeholders.
 
 ─── Result: "agent_verified" ────────────────────────────────────────────────
 
@@ -520,8 +570,7 @@ Your response MUST begin with the exact result text — zero words before it.
     → Do NOT go through the "is that you?" exchange — they are already confirmed.
 
   IF _ctx.salespersonCallResult is null (normal flow):
-    → Say EXACTLY: "I found an account linked to your number — [first name from result]. Is that you?"
-      ⚠️ Do NOT say "Welcome to Culture Holidays" — the greeting already played. Start with "I found…"
+    → Say EXACTLY: "Welcome to Culture Holidays! I found an account linked to your number — [first name from result]. Is that you?"
     → Wait for YES / NO:
         YES → Say: "Great, welcome back [first name]! How may I assist you today?
                     You can ask me about a new booking, your existing bookings,
@@ -569,11 +618,16 @@ After identity is confirmed, listen to what the caller wants and transfer accord
 | New booking / tour enquiry / want to travel                  | any              | New Booking          |
 | Existing booking / my trip / my booking                      | agent_verified   | Existing Booking     |
 | Existing booking / my trip / my booking                      | NOT verified     | Human Support Router |
+| Payment / billing / check payment / pay balance / failed payment / outstanding amount | agent_verified | Existing Booking |
+| Payment / billing / check payment                            | NOT verified     | Human Support Router |
 | Speak to human / manager / real person                       | any              | Human Support Router |
 | I'm an agent / verify / register my number (no booking ask) | any              | Human Support Router |
 | Send details / email / SMS                                   | any              | Communication        |
 | Connect to my sales person / talk to salesperson / CHAM-... / my message ID | agent_verified | Sales Connect |
 | Connect to my account manager / person handling my enquiry  | agent_verified   | Sales Connect        |
+
+NOTE — payment queries from verified agents: always route to Existing Booking first, NOT directly to Payment.
+Payment needs an active booking reference (set by Existing Booking) to work. The caller will identify their booking in Existing Booking, which then transfers automatically to Payment.
 
 CRITICAL RULE — Sales Connect is for verified agents ONLY:
 If an unverified or unknown caller asks to speak to their salesperson:
@@ -834,6 +888,11 @@ They have no verified bookings on record.
 If the caller mentions a CHAM-... query ID or asks to speak to their salesperson / account manager:
   → Transfer to Sales Connect immediately.
 
+## PAYMENT REDIRECT (verified agents only)
+If at ANY point the caller asks about payment, outstanding balance, payment link, failed payment, or billing for an existing booking:
+  → Transfer to Existing Booking immediately (NOT directly to Payment — Payment requires a booking to be loaded first).
+  Do NOT try to handle payment queries yourself.
+
 ## COMMISSION GUARDRAIL — MANDATORY
 If the caller asks ANYTHING related to commission — "how much commission", "my commission", "commission on this booking", "what's my cut", "payout", etc.:
   DO NOT answer or guess. Say EXACTLY: "Commission details are handled by our support team. Would you like me to connect you with a customer support executive?"
@@ -950,7 +1009,7 @@ If 2 or more entries in bookings[] share the same PKG_TITLE:
 Read ONLY these 5 things in one sentence:
   "[PKG_TITLE], departing [CheckinDate], [DurationDays] days [DurationNights] nights,
    [NumGuests] guests. USD [AmountPaid] paid, USD [BalanceDue] still outstanding."
-Then immediately ask: "What would you like to know or do — guests, itinerary, a change request, or something else?"
+Then immediately ask: "What would you like to know or do — guests, payments, a change request, or something else?"
 
 DO NOT read BookingStatus, Country, DaysUntilTour, TotalAmount, TripType, or CheckoutDate
 unless the caller specifically asks for them.
@@ -1151,7 +1210,12 @@ Read from the most recent tool response (or from the initial context passed at t
   Wait for caller's YES / NO to your first-turn offer:
 
   YES:
-    → Call: transferToHuman({ department: <mapped dept>, reason: <reason from context> })
+    → Say EXACTLY: "Perfect, connecting you now." — say this BEFORE calling transferToHuman.
+      ⛔ Do NOT say "Hold on", "One sec", "Just a sec", or any other filler. Say "Perfect, connecting you now." — nothing else.
+    → Immediately (in the same turn) call: transferToHuman({ department: <mapped dept>, reason: <reason from context> })
+      ── If transferToHuman returns { success: true, transferring: true } (normal path) ──
+         ⛔ MANDATORY: call endCall immediately. Do NOT speak any more words. Do NOT wait. Just call endCall now.
+         The caller will be automatically connected to the support agent after endCall.
       ── If transferToHuman returns { success: false, unavailable: true } (team on holiday) ──
          Read the "message" field from the tool response, then arrange a callback immediately:
          "Our team is unavailable right now. I'll arrange a callback on [_ctx.phone] for you."
@@ -1219,11 +1283,21 @@ If _ctx.type is NOT "agent_verified":
   → Call transferToHuman({ department: "billing", reason: "unverified caller requesting payment access" }) immediately.
 
 ## ON ARRIVAL — DO THIS FIRST
-Your very first response MUST:
-  1. Say exactly: "Sure, one sec!"
-  2. Simultaneously call: getPaymentDetails({ bookingRef: _ctx.activeBookingRef })
-Both happen in the same response turn — speak the line WHILE the tool runs.
-After the tool returns, IMMEDIATELY speak the result — do NOT pause or wait for the caller.
+
+⚠️ FIRST CHECK: Is _ctx.activeBookingRef set?
+
+If _ctx.activeBookingRef is NULL or empty (arrived without a booking context):
+  Say: "Which booking would you like to discuss? Please give me the booking reference or package name."
+  → Get the booking reference from the caller.
+  → Call: getBookingDetails({ bookingRef: <booking ref provided> })
+  → Then continue with the payment flow below using the loaded booking data.
+
+If _ctx.activeBookingRef IS set (normal arrival from Existing Booking):
+  Your very first response MUST:
+    1. Say exactly: "Sure, one sec!"
+    2. Simultaneously call: getPaymentDetails({ bookingRef: _ctx.activeBookingRef })
+  Both happen in the same response turn — speak the line WHILE the tool runs.
+  After the tool returns, IMMEDIATELY speak the result — do NOT pause or wait for the caller.
 
 Read ONLY these 4 things in one sentence:
   "Total booking cost is USD [TotalAmount], [AmountPaid] paid so far, [BalanceDue] still outstanding, due by [LastPaymentDate]."
@@ -1313,6 +1387,17 @@ If payment.summary.PaymentUrl is null or absent:
 ### Flow F — Cancellation with refund implication
 Follow the same steps as Flow E but use requestType: "cancellation".
 NEVER promise a specific refund amount — just say "our team will advise you on the refund process."
+
+## CROSS-ROUTING
+
+### Caller asks about a new booking / new trip enquiry / new destination:
+→ Transfer to New Booking immediately. Do NOT try to handle it yourself.
+
+### Caller asks about a DIFFERENT existing booking (not the current payment query):
+→ Transfer to Existing Booking immediately so they can load the new booking.
+
+### Caller asks about booking changes, itinerary, or guest details unrelated to payment:
+→ Transfer to Existing Booking immediately (Rule 5).
 
 ## CLOSING
 After resolving the payment query:
@@ -1472,28 +1557,77 @@ Read the message field: "You have [count] queries. Could you tell me your CHAM I
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ASSISTANT_DEFAULTS = {
+  // ── LLM ────────────────────────────────────────────────────────────────────
   model: {
     provider: 'openai',
-    model:    'gpt-4o',
+    model:    'gpt-4o',   // Most capable + lowest latency for tool calls.
+                          // Switch to 'gpt-4o-mini' only if cost is critical —
+                          // complex routing accuracy drops noticeably.
   },
+
+  // ── Voice (ElevenLabs TTS) ─────────────────────────────────────────────────
+  // Applied to ALL assistants unless a specific assistant defines its own 'voice'.
+  // To override for one assistant, add a 'voice' key inside its ASSISTANTS entry.
   voice: {
-    provider: '11labs',
-    voiceId:  'EXAVITQu4vr4xnSDxMaL', // Rachel — warm, professional
+    provider:        '11labs',
+    voiceId:         'EXAVITQu4vr4xnSDxMaL', // Rachel — warm, calm, professional
+                                               // Works for both friendly (New Booking)
+                                               // and empathetic (Support/Payment) flows.
+
+    stability:       0.5,    // Range 0–1.  0 = expressive/emotional, 1 = consistent/flat.
+                              // 0.5 = natural balance with slight tonal variation.
+
+    similarityBoost: 0.75,   // Range 0–1.  How closely output matches Rachel's voice profile.
+                              // 0.75 gives clear, natural-sounding output on phone audio.
+
+    style:           0,      // Range 0–1.  Style exaggeration.
+                              // 0 = professional, neutral.
+                              // 0.2–0.3 = warmer, slightly more expressive (try for HSR).
+
+    useSpeakerBoost: true,   // Post-processing to enhance clarity on phone audio.
+                              // Always keep true for telephony use.
+
+    speed:           1.0,    // Speech rate. 1.0 = normal.
+                              // 0.9 = slightly slower — recommended for Payment / Support
+                              // when reading out numbers and amounts.
   },
-  // Deepgram Nova-3: keyTerms boosting (Nova-3 feature) handles spelled-out agent IDs
-  // and Indian English better than Nova-2 keywords.
+
+  // ── Speech-to-Text (Deepgram) ───────────────────────────────────────────────
   transcriber: {
-    provider:  'deepgram',
-    model:     'nova-3',
-    language:  'en',
-    keywords:  ['chagt:10', 'cultureholidays:5'],
+    provider: 'deepgram',
+    model:    'nova-3',   // nova-3 > nova-2: better Indian English accuracy
+                          // + supports keyword boost (nova-3 exclusive feature).
+    language: 'en',
+    keywords: [
+      'chagt:10',           // Boost agent ID prefix — callers spell it out letter by letter.
+                            // Weight 10 = strong preference over phonetically similar words.
+      'cultureholidays:5',  // Company name always recognised correctly.
+                            // Weight 5 = moderate boost.
+    ],
+    // Note: 'keywords' in Vapi maps to Deepgram's 'keyterms' param for nova-3.
+    // Format: 'word:boost_weight'. Max boost weight recommended: 10.
   },
-  maxDurationSeconds:       600,
-  silenceTimeoutSeconds:    20,
-  backgroundSound:          'office',
-  endCallFunctionEnabled:   true,
-  endCallPhrases:           ['goodbye', 'thank you goodbye', 'have a good day', 'have a wonderful day'],
-  responseDelaySeconds:     0.5,
+
+  // ── Call limits ─────────────────────────────────────────────────────────────
+  maxDurationSeconds:    600,  // Hard cap: 10 minutes per call.
+  silenceTimeoutSeconds: 20,   // Hang up after 20 s of complete silence from caller.
+
+  // ── Audio feel ──────────────────────────────────────────────────────────────
+  backgroundSound:      'office',  // Subtle office ambience under the AI voice.
+                                    // Makes calls feel natural, not silent/sterile.
+                                    // Options: 'office' | 'cafe' | 'off'
+
+  responseDelaySeconds: 0.5,  // Pause before AI speaks after caller stops.
+                               // 0.5 s feels human; 0 = instant (feels robotic).
+
+  // ── End-call triggers ───────────────────────────────────────────────────────
+  endCallFunctionEnabled: true,  // Enables the built-in endCall function the AI can call.
+  endCallPhrases: [              // AI auto-ends call if it speaks any of these phrases.
+    'goodbye',
+    'thank you goodbye',
+    'have a good day',
+    'have a wonderful day',
+  ],
 };
 
 module.exports = { TOOLS, ASSISTANTS, ASSISTANT_DEFAULTS };

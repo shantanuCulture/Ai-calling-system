@@ -11,7 +11,10 @@ const topicBuffer  = require('../utils/topicBuffer');
 const { normalize: normalizePhone } = require('../utils/phoneUtils');
 const logger             = require('../utils/logger');
 const resolvePackageRef  = require('../utils/resolvePackageRef');
-const businessHours      = require('../utils/businessHours');
+const businessHours            = require('../utils/businessHours');
+const { getActiveAgents }      = require('../utils/businessHours');
+const { findSidByPhone }       = require('../utils/callSession');
+const { getTwilioClient }      = require('../integrations/twilio');
 
 // ── Country list cache ────────────────────────────────────────────────────────
 // Loaded once from DB, refreshed every hour. Used to match destination names
@@ -519,21 +522,43 @@ class VapiController {
       const normalizedPhone = normalizePhone(phone) || phone || 'unknown';
       logger.info('VAPI CALL STARTED', { twilioSid, vapiId, phone });
 
-      // Create DB record (replaces handleIncomingCall when Vapi owns the number)
+      // Create DB record (replaces handleIncomingCall when Vapi owns the number).
+      // When our server routes via <Dial><Sip>, handleIncomingCall already created
+      // a session under the PARENT call SID with the same phone. In that case,
+      // twilioSid here is the child dial-leg SID — link it to the parent session
+      // instead of creating a duplicate DB record.
       if (twilioSid) {
-        const record = await dbService.insertCallMaster({
-          twilio_call_sid: twilioSid,
-          caller_phone:    normalizedPhone,
-          called_phone:    message?.call?.phoneNumber?.number || config.TWILIO_PHONE_NUMBER,
-          direction:       'inbound',
-          vapi_call_id:    vapiId,
-        }).catch(() => null); // idempotent — ignore if already exists
+        const parentSid = findSidByPhone(normalizedPhone);
+        const parentSession = parentSid ? callSession.get(parentSid) : null;
+
+        let callId;
+        if (parentSession?.callId) {
+          // Parent session already has a DB record — reuse it, link dial-leg SID
+          callId = parentSession.callId;
+          // Store the dial-leg SID → parent SID link so /after-vapi can find it
+          callSession.merge(twilioSid, { _parentSid: parentSid });
+          // Also update parent session with vapiCallId and dial-leg SID
+          callSession.merge(parentSid, { vapiCallId: vapiId, _dialLegSid: twilioSid, _dbInitialized: true });
+          await dbService.updateCallMaster({ twilio_call_sid: parentSid, vapi_call_id: vapiId }).catch(() => {});
+          logger.info('Vapi call-start: linked dial-leg to parent session', { dialLegSid: twilioSid, parentSid, callId });
+        } else {
+          // No parent session — Vapi owns the number directly, create fresh DB record
+          const record = await dbService.insertCallMaster({
+            twilio_call_sid: twilioSid,
+            caller_phone:    normalizedPhone,
+            called_phone:    message?.call?.phoneNumber?.number || config.TWILIO_PHONE_NUMBER,
+            direction:       'inbound',
+            vapi_call_id:    vapiId,
+          }).catch(() => null); // idempotent — ignore if already exists
+          callId = record?.CallID || null;
+          logger.info('Call record created via Vapi event', { callId, twilioSid });
+        }
 
         const sessionKey = twilioSid;
         // Merge so destination/lastUserText captured by earlier conversation-update events survive.
         // _dbInitialized prevents the tool-call handler from running a redundant DB lookup.
         callSession.merge(sessionKey, {
-          callId:         record?.CallID || null,
+          callId:         callId,
           phone:          normalizedPhone,
           callerType:     'unknown',
           isVerified:     false,
@@ -541,9 +566,8 @@ class VapiController {
           _dbInitialized: true,
         });
         // Start per-call JSON log (idempotent — skips if already started by Twilio webhook)
-        callLogger.start(twilioSid, { phone: normalizedPhone, direction: 'inbound', callId: record?.CallID || null });
+        callLogger.start(twilioSid, { phone: normalizedPhone, direction: 'inbound', callId });
         callLogger.callEvent(twilioSid, 'call_started', { phone: normalizedPhone, vapiId });
-        logger.info('Call record created via Vapi event', { callId: record?.CallID, twilioSid });
 
         // Pre-load caller identity non-blocking so identifyCaller tool responds
         // instantly from cache (<5ms) instead of waiting for a DB round-trip (300-400ms).
@@ -1628,27 +1652,65 @@ class VapiController {
       await dbService.updateCallMaster({ twilio_call_sid: _twilioCallSid, routed_to: `human_${department || 'sales'}`, routing_reason: reason || null });
     }
 
-    // For real Twilio phone calls: redirect the active call to the simultaneous-ring endpoint.
-    // Vapi's SIP leg gets replaced with a TwiML <Dial> that rings all SUPPORT_NUMBERS at once.
     const session = _twilioCallSid ? callSession.get(_twilioCallSid) : {};
+
+    // ── For real Twilio calls: store the pending transfer in session ───────────
+    // Do NOT redirect via REST API (client.calls.update).
+    // When the AI calls endCall, the Vapi SIP leg ends → Twilio calls /api/twilio/after-vapi
+    // (the action URL on the initial <Dial>) → we read pendingTransfer and dial the support number.
+    // This eliminates the race condition where the parent PSTN call hangs up before
+    // the redirected TwiML can execute a <Dial>.
     if (_twilioCallSid && !session.webCall) {
+      // Idempotency: don't redirect twice if the tool is called multiple times
+      if (session.transferInitiated) {
+        logger.info(`[transferToHuman] Transfer already initiated — ignoring duplicate call`, { callSid: _twilioCallSid });
+        return {
+          success:      true,
+          transferring: true,
+          department:   department || 'support',
+          _ctx:         this._buildCtx(_twilioCallSid),
+          message:      'Transfer already in progress. ⛔ Do NOT call transferToHuman again. Do NOT call any other tool.',
+        };
+      }
+
+      let transferNumbers = [];
       try {
-        const { getTwilioClient } = require('../integrations/twilio');
-        const client = getTwilioClient();
-        await client.calls(_twilioCallSid).update({
-          url:    `${config.BASE_URL}/api/twilio/human-support`,
-          method: 'POST',
+        const dbAgents = await getActiveAgents('support');
+        transferNumbers = dbAgents.map(a => a.phone).filter(Boolean);
+      } catch {}
+      if (transferNumbers.length === 0) transferNumbers = config.SUPPORT_NUMBERS || [];
+
+      // Redirect the live Twilio call directly to the support number via inline TwiML.
+      // No pendingTransfer, no action URL, no SIP complexity — Twilio immediately
+      // executes the new <Dial> on the active PSTN call.
+      const numberTags = transferNumbers
+        .map(n => `<Number statusCallback="${config.BASE_URL}/api/twilio/dial-leg-status" statusCallbackMethod="POST" statusCallbackEvent="initiated ringing answered completed">${n}</Number>`)
+        .join('');
+      const twiml = `<Response><Dial callerId="${config.TWILIO_PHONE_NUMBER}" timeout="30" action="${config.BASE_URL}/api/twilio/transfer-fallback" method="POST">${numberTags}</Dial></Response>`;
+
+      try {
+        const twilioClient = getTwilioClient();
+        await twilioClient.calls(_twilioCallSid).update({ twiml });
+        callSession.merge(_twilioCallSid, { transferInitiated: true });
+        logger.info(`[transferToHuman] Call redirected to support via Twilio REST`, {
+          callSid: _twilioCallSid, department, transferNumbers,
         });
-        logger.info(`[transferToHuman] Call redirected to /human-support`, { callSid: _twilioCallSid, department });
       } catch (err) {
-        logger.warn(`[transferToHuman] Twilio redirect failed: ${err.message}`, { callSid: _twilioCallSid });
+        logger.error(`[transferToHuman] Twilio redirect failed`, { callSid: _twilioCallSid, error: err.message });
+        return {
+          success: false,
+          error:   'Transfer failed — could not redirect call.',
+          _ctx:    this._buildCtx(_twilioCallSid),
+        };
       }
     }
 
     return {
-      success: true, transferring: true, department: department || 'sales',
-      _ctx: this._buildCtx(_twilioCallSid),
-      message: `Connecting you with our ${department || 'sales'} team now. Please hold.`,
+      success:      true,
+      transferring: true,
+      department:   department || 'support',
+      _ctx:         this._buildCtx(_twilioCallSid),
+      message:      'Transfer initiated. ⛔ Do NOT call transferToHuman again. Do NOT call any other tool. Say nothing more.',
     };
   }
 

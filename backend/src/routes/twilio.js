@@ -5,6 +5,9 @@ const ctrl = require('../controllers/twilioController');
 // Inbound call from Twilio (set this URL in Twilio console → Phone Numbers)
 router.post('/incoming-call', ctrl.handleIncomingCall.bind(ctrl));
 
+// Called when the Vapi SIP <Dial> ends — checks for pendingTransfer to dial support agent
+router.post('/after-vapi', ctrl.handleAfterVapi.bind(ctrl));
+
 // Human escalation: transfer active call to an agent
 router.post('/transfer-call', ctrl.handleTransferCall.bind(ctrl));
 
@@ -28,5 +31,8 @@ router.post('/connect-salesperson', ctrl.handleConnectSalesperson.bind(ctrl));
 
 // Fallback when salesperson doesn't answer — returns call to Vapi Squad
 router.post('/salesperson-fallback', ctrl.handleSalespersonFallback.bind(ctrl));
+
+// Per-leg status for outbound dial (initiated/ringing/answered/completed) — diagnostic
+router.post('/dial-leg-status', ctrl.handleDialLegStatus.bind(ctrl));
 
 module.exports = router;
