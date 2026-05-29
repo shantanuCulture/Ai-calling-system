@@ -1,52 +1,58 @@
+'use strict';
+
+const fs            = require('fs').promises;
 const twilioService = require('../services/twilioService');
-const databaseService = require('../services/databaseService');
-const logger = require('../utils/logger');
+const dbService     = require('../services/dbService');
+const callLogger    = require('../utils/callLogger');
+const logger        = require('../utils/logger');
 
 class CallController {
-  /**
-   * POST /api/call/outbound
-   * Triggers an outbound call to a customer using Twilio, which then connects
-   * the answered call to the configured Vapi assistant.
-   */
+
+  /** POST /api/call/outbound */
   async initiateOutboundCall(req, res) {
     const { to, assistantId, customerName, notes } = req.body;
-
-    if (!to) {
-      return res.status(400).json({ success: false, error: 'Phone number "to" is required' });
-    }
+    if (!to) return res.status(400).json({ success: false, error: 'Phone number "to" is required' });
 
     logger.info(`Initiating outbound call to: ${to}`);
     const call = await twilioService.initiateOutboundCall({ to, vapiAssistantId: assistantId });
 
-    databaseService.saveCallLog({
-      callSid: call.sid,
-      from: call.from,
-      to: call.to,
-      customerName,
-      notes,
-      direction: 'outbound',
-      status: call.status,
-    });
-
     res.json({
       success: true,
       callSid: call.sid,
-      status: call.status,
-      to: call.to,
+      status:  call.status,
+      to:      call.to,
       message: `Outbound call initiated to ${to}`,
     });
   }
 
-  /** GET /api/call/logs */
-  async getCallLogs(req, res) {
-    const logs = databaseService.getAllCallLogs();
-    res.json({ success: true, count: logs.length, callLogs: logs });
+  /** GET /api/call/history — call records from DB */
+  async getHistory(req, res) {
+    const limit = parseInt(req.query.limit, 10) || 100;
+    const rows  = await dbService.getCallHistory(limit);
+    res.json({ success: true, count: rows.length, calls: rows });
   }
 
-  /** GET /api/call/leads */
-  async getLeads(req, res) {
-    const leads = databaseService.getAllLeads();
-    res.json({ success: true, count: leads.length, leads });
+  /** GET /api/call/stats — aggregated dashboard stats */
+  async getStats(req, res) {
+    const stats = await dbService.getCallStats();
+    res.json({ success: true, stats });
+  }
+
+  /** GET /api/call/detail/:callSid — full JSON log for one call */
+  async getDetail(req, res) {
+    const { callSid } = req.params;
+    const filePath    = await callLogger.findFile(callSid);
+    if (!filePath) return res.status(404).json({ success: false, error: 'Call log not found' });
+    const raw  = await fs.readFile(filePath, 'utf8');
+    const data = JSON.parse(raw);
+    res.json({ success: true, call: data });
+  }
+
+  /** GET /api/call/files — list of available log files */
+  async getFiles(req, res) {
+    const limit = parseInt(req.query.limit, 10) || 100;
+    const files = await callLogger.listFiles(limit);
+    res.json({ success: true, count: files.length, files });
   }
 }
 

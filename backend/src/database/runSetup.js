@@ -51,16 +51,21 @@ function splitOnGo(source) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const sqlFilePath = path.join(__dirname, 'setup.sql');
+  // Run schema.sql then stored_procedures.sql in sequence
+  const sqlFiles = [
+    path.join(__dirname, 'schema.sql'),
+    path.join(__dirname, 'stored_procedures.sql'),
+  ];
 
-  // 1. Read the SQL file
-  console.log(`\nReading SQL file: ${sqlFilePath}`);
-  let source;
-  try {
-    source = fs.readFileSync(sqlFilePath, 'utf8');
-  } catch (err) {
-    console.error(`ERROR: Could not read setup.sql — ${err.message}`);
-    process.exit(1);
+  let source = '';
+  for (const sqlFilePath of sqlFiles) {
+    console.log(`\nReading SQL file: ${sqlFilePath}`);
+    try {
+      source += fs.readFileSync(sqlFilePath, 'utf8') + '\nGO\n';
+    } catch (err) {
+      console.error(`ERROR: Could not read ${path.basename(sqlFilePath)} — ${err.message}`);
+      process.exit(1);
+    }
   }
 
   // 2. Split into batches

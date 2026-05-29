@@ -5,6 +5,7 @@ const navItems = [
   { to: '/', label: 'Dashboard', icon: '◉', end: true },
   { to: '/call-logs', label: 'Call Logs', icon: '☎' },
   { to: '/agents', label: 'Agents', icon: '👤' },
+  { to: '/live-logs', label: 'Live Logs', icon: '⬤' },
 ];
 
 export default function Layout() {

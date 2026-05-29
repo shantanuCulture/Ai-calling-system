@@ -416,6 +416,50 @@ class DbService {
       return [];
     }
   }
+  // ── Dashboard / call history ───────────────────────────────────────────────
+
+  async getCallHistory(limit = 100) {
+    try {
+      const pool = getPool();
+      const n = parseInt(limit, 10);
+      const safeLimit = Number.isFinite(n) && n > 0 ? n : 100;
+      const r = await pool.request().query(`
+        SELECT TOP ${safeLimit}
+          CallID, TwilioCallSID, CallerPhone, CalledPhone, Direction,
+          CallerStatus, AgentID, CallerName, CallerEmail,
+          CallStatus, CallStartedAt, CallEndedAt, DurationSecs,
+          RoutedTo, RoutingReason, CallSummary, IsResolved
+        FROM ai_call_system_call_master
+        ORDER BY CallStartedAt DESC
+      `);
+      return r.recordset;
+    } catch (err) {
+      logger.error('getCallHistory failed', { err: err.message });
+      return [];
+    }
+  }
+
+  async getCallStats() {
+    try {
+      const pool = getPool();
+      const r = await pool.request().query(`
+        SELECT
+          COUNT(*)                                                                    AS total,
+          SUM(CASE WHEN Direction = 'inbound'  THEN 1 ELSE 0 END)                   AS inbound,
+          SUM(CASE WHEN Direction = 'outbound' THEN 1 ELSE 0 END)                   AS outbound,
+          SUM(CASE WHEN RoutedTo  = 'human_support' THEN 1 ELSE 0 END)              AS transferred,
+          SUM(CASE WHEN IsResolved = 1 THEN 1 ELSE 0 END)                           AS resolved,
+          AVG(CAST(ISNULL(DurationSecs, 0) AS FLOAT))                               AS avgDuration,
+          SUM(CASE WHEN CAST(CallStartedAt AS DATE) = CAST(GETDATE() AS DATE)
+                   THEN 1 ELSE 0 END)                                               AS today
+        FROM ai_call_system_call_master
+      `);
+      return r.recordset[0] || {};
+    } catch (err) {
+      logger.error('getCallStats failed', { err: err.message });
+      return {};
+    }
+  }
 }
 
 module.exports = new DbService();

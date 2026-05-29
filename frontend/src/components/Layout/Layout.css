@@ -92,10 +92,15 @@
 /* ── Main Content ─────────────────────────────────────── */
 .main-content {
   flex: 1;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding: 28px 32px;
-  max-width: 1200px;
+  max-width: 1400px;
 }
+
+/* Pages that need full height (Call Logs split view) get their own overflow */
+.main-content > * { flex: 1; min-height: 0; }
 
 /* ── Shared Utility Classes ───────────────────────────── */
 .page-header {

@@ -18,6 +18,9 @@ const config = {
   // Public base URL for webhooks
   BASE_URL: process.env.BASE_URL || 'http://localhost:3001',
 
+  // Allowed frontend origin(s) for CORS — comma-separated if multiple
+  FRONTEND_URL: process.env.FRONTEND_URL || '*',
+
   // SQL Server
   DB_SERVER: process.env.DB_SERVER,
   DB_NAME: process.env.DB_NAME,

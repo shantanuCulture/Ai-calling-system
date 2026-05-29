@@ -1,10 +1,16 @@
 import axios from 'axios';
 
+// VITE_API_BASE_URL = backend origin e.g. https://api.cultureholidays.com
+// Leave blank in development — Vite proxy handles /api → localhost:3001
+const API_ORIGIN = import.meta.env.VITE_API_BASE_URL || '';
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: `${API_ORIGIN}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
 });
+
+export const API_ORIGIN_EXPORT = API_ORIGIN;
 
 api.interceptors.response.use(
   (res) => res.data,
@@ -16,9 +22,11 @@ api.interceptors.response.use(
 
 // ── Calls ──────────────────────────────────────────────────────────────────────
 export const callApi = {
-  initiateOutbound: (data) => api.post('/call/outbound', data),
-  getLogs: () => api.get('/call/logs'),
-  getLeads: () => api.get('/call/leads'),
+  initiateOutbound: (data)     => api.post('/call/outbound', data),
+  getHistory:       (limit)    => api.get('/call/history', { params: { limit } }),
+  getStats:         ()         => api.get('/call/stats'),
+  getDetail:        (callSid)  => api.get(`/call/detail/${callSid}`),
+  getFiles:         ()         => api.get('/call/files'),
 };
 
 // ── Agents ─────────────────────────────────────────────────────────────────────

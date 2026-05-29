@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
+const config = require('./config');
 const logger = require('./utils/logger');
 const twilioRoutes = require('./routes/twilio');
 const vapiRoutes = require('./routes/vapi');
@@ -11,11 +12,19 @@ const agentRoutes = require('./routes/agent');
 const packageRoutes = require('./routes/package');
 const countryRoutes = require('./routes/country');
 const communicationRoutes = require('./routes/communication');
+const logsRoutes = require('./routes/logs');
 
 const app = express();
 
+// ── CORS — allow the frontend domain (set FRONTEND_URL in .env for cross-domain) ──
+const corsOptions = {
+  origin: config.FRONTEND_URL !== '*' ? config.FRONTEND_URL.split(',').map(u => u.trim()) : '*',
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 app.use(morgan('combined', { stream: { write: (m) => logger.info(m.trim()) } }));
@@ -28,6 +37,7 @@ app.use('/api/agents', agentRoutes);
 app.use('/api/packages', packageRoutes);
 app.use('/api/countries', countryRoutes);
 app.use('/api/communication', communicationRoutes);
+app.use('/api/logs', logsRoutes);
 
 // Health check
 app.get('/health', (_req, res) =>

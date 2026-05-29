@@ -509,6 +509,7 @@ class VapiController {
           callLogger.start(eocKey, { phone: s.phone || 'unknown', direction: dir, callId: s.callId || null });
         }
         callLogger.callEvent(eocKey, 'vapi_end_of_call', { summary: summary?.substring(0, 200) || null, durationSeconds: duration });
+        if (transcript) callLogger.addTranscript(eocKey, transcript);
         await callLogger.flush(eocKey, {
           session: callSession.get(eocKey),
           summary: summary || null,

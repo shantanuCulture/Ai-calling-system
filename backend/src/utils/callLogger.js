@@ -75,6 +75,40 @@ class CallLogger {
     this._push(callSid, { ts: new Date().toISOString(), type: event, ...(data || {}) });
   }
 
+  // ── Transcript ──────────────────────────────────────────────────────────────
+
+  addTranscript(callSid, rawTranscript) {
+    const log = this._store.get(callSid);
+    if (!log || !rawTranscript) return;
+    // Parse "AI: ..." / "User: ..." lines into structured array
+    log.transcript = rawTranscript
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => {
+        if (l.startsWith('AI:'))   return { role: 'assistant', text: l.slice(3).trim() };
+        if (l.startsWith('User:')) return { role: 'user',      text: l.slice(5).trim() };
+        return { role: 'system', text: l };
+      });
+  }
+
+  // ── File lookup ─────────────────────────────────────────────────────────────
+
+  async findFile(callSid) {
+    const files = await fs.readdir(LOG_DIR).catch(() => []);
+    const match = files.find(f => f.includes(callSid));
+    return match ? path.join(LOG_DIR, match) : null;
+  }
+
+  async listFiles(limit = 100) {
+    const files = await fs.readdir(LOG_DIR).catch(() => []);
+    return files
+      .filter(f => f.endsWith('.json'))
+      .sort()
+      .reverse()
+      .slice(0, limit);
+  }
+
   // ── Flush to disk ───────────────────────────────────────────────────────────
 
   async flush(callSid, { session, summary } = {}) {

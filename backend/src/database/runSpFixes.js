@@ -22,7 +22,7 @@ const config = {
 };
 
 async function run() {
-  const sqlFile = path.join(__dirname, 'sp_fixes.sql');
+  const sqlFile = path.join(__dirname, 'stored_procedures.sql');
   const raw     = fs.readFileSync(sqlFile, 'utf8');
   const batches = raw.split(/^\s*GO\s*$/im).map((b) => b.trim()).filter(Boolean);
 

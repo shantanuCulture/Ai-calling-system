@@ -1,7 +1,18 @@
 const winston = require('winston');
 const path = require('path');
+const { broadcast } = require('./logBroadcaster');
 
 const { combine, timestamp, errors, json, printf, colorize } = winston.format;
+
+// Custom transport — streams every log entry to connected SSE clients.
+class SseTransport extends winston.Transport {
+  log(info, callback) {
+    setImmediate(() => this.emit('logged', info));
+    const { level, message, timestamp: ts, service: _s, splat: _sp, ...meta } = info;
+    broadcast({ level, message, timestamp: ts, ...meta });
+    callback();
+  }
+}
 
 // Readable single-line console format:
 //   10:42:31 [INFO]  Inbound call received  from=+919876543210 sid=CA123...
@@ -34,6 +45,7 @@ const logger = winston.createLogger({
     new winston.transports.File({
       filename: path.join('logs', 'combined.log'),
     }),
+    new SseTransport(),
   ],
 });
 
